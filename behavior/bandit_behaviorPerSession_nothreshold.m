@@ -1,0 +1,159 @@
+function bandit_behaviorPerSession_nothreshold(dataIndex,save_path)
+% % bandit_behaviorPerSession %
+%PURPOSE:   Analyze bandit behavior averaged across sessions
+%AUTHORS:   H Atilgan and AC Kwan 191204
+%
+%INPUT ARGUMENTS
+%   dataIndex:    a database index table for the sessions to analyze
+%   save_path:    path for saving the plots
+%
+%OUTPUT ARGUMENTS
+%
+
+%%
+if ~exist(save_path,'dir')
+    mkdir(save_path);
+end
+
+%% go through each session
+
+disp('-----------------------------------------------------------');
+disp(['--- Analyzing - summary of ', int2str(size(dataIndex,1)) ' sessions']);
+disp('-----------------------------------------------------------');
+
+Lcriteria = 200; % no criterial.
+
+for j = 1:size(dataIndex,1)
+    
+    load(fullfile(dataIndex.BehPath{j},[dataIndex.LogFileName{j}(1:end-4),'_beh.mat']));
+   
+    trials = value_getTrialMasks(trialData);
+    stats = value_getTrialStats(trials, sessionData.nRules);
+    stats = value_getTrialStatsMore(stats);
+    
+    %% plot choice behavior - around switches left to right
+    trials_back=10;  % set number of previous trials
+    
+    sw_output{j}=choice_switch(stats,trials_back);
+    
+    %% plot choice behavior - around switch high-probability side to low-probability side
+    sw_hrside_output{j}=choice_switch_hrside(stats,trials_back);
+
+    %% plot choice behavior - around switches left to right, as a function of the statistics of the block preceding the switch
+    L1_ranges=[10 Lcriteria;10 Lcriteria;10 Lcriteria;10 Lcriteria;]; %consider only subset of blocks within the range, for trials to criterion
+    L2_ranges=[0 4;5 9;10 14;15 30]; %[ 0 4;5 15; 16 30];%   %consider only subset of blocks within the range, for random added number of trials
+    sw_random_output{j}=choice_switch_random(stats,trials_back,L1_ranges,L2_ranges);
+
+    sw_hrside_random_output{j}=choice_switch_hrside_random(stats,trials_back,L1_ranges,L2_ranges);
+    
+    %% plot lick rates
+    trialType={{'left','reward'},{'left','noreward'},{'right','reward'},{'right','noreward'}};
+    edges=[-0.5:0.02:3];   % edges to plot the lick rate histogram
+    lick_trType{j}=get_lickrate_byTrialType(trialData,trials,trialType,edges);
+    
+    %% plot response times
+    valLabel='Response time (s)';
+    trialType={'go','left','right'};
+    edges=[0:0.01:1];
+    respTime_trType{j}=get_val_byTrialType(trialData.rt,trials,trialType,edges,valLabel);
+    
+    %% plot ITI
+    valLabel='Inter-trial interval (s)';
+    trialType={'go','reward','noreward'};
+    edges=[0:0.1:30];
+    iti_trType{j}=get_val_byTrialType(trialData.iti,trials,trialType,edges,valLabel);
+% 
+%     %% plot logistic regression analysis - rewarded/unrewarded choices
+%     num_regressor = 10;
+%     [lreg{j}, ~, ~, ~]=logreg_RCUC(stats,num_regressor);
+
+    %% plot logistic regression analysis - rewarded/unrewarded left/right choices
+    % this analysis is ill-conditioned -- too many regressors for too few trials in some sessions
+%    num_regressor = 10;
+%    [lreg_LR{j}, ~, ~, ~]=logreg_RCUC_LR(stats,num_regressor);
+%Trials to
+        L2_ranges=[1:1:30 ; 1:1:30]' ;       % Random Block length steps
+        L1_ranges= ones(size(L2_ranges,1),2).*[10 20];    % BehCriteria
+        trials_forward = 50;
+        sw_stats_output{j} = choice_switch_stats_random(stats,trials_back,trials_forward,L1_ranges,L2_ranges);
+        
+        sw_LRVsMidpoint{j}.dat=[L2_ranges(:,1) sw_stats_output{j}.stath(1,:)'];
+        sw_LRVsMidpoint{j}.range{1}=[0 30];
+        sw_LRVsMidpoint{j}.range{2}=[0 10];
+        sw_LRVsMidpoint{j}.label{1}={'L_{Random}'};
+        sw_LRVsMidpoint{j}.label{2}= [{'Trials to reach midpoint'};{'fraction of trials = 0.5'}];
+        
+        ind = stats.blockTrialtoCrit<=2000;
+        sw_LRVsChoice{j}.dat=[stats.blockTrialRandomAdded(ind) stats.blockPreSwitchBetterChoiceRate(ind)];
+        sw_LRVsChoice{j}.range{1}=[1 30];
+        sw_LRVsChoice{j}.range{2}=[0.7 1];
+        sw_LRVsChoice{j}.label{1}={'L_{Random}'};
+        sw_LRVsChoice{j}.label{2}={'Fraction of trials'};%;'select
+end
+
+%% plotting
+tlabel = ['Summary of ' int2str(size(dataIndex,1)) ' sessions'];
+
+plot_switch(sw_output,tlabel,stats.rule_labels);
+print(gcf,'-dpng',fullfile(save_path,'switches_lateral'));
+saveas(gcf, fullfile(save_path,'switches_lateral'), 'fig');
+
+plot_switch_hrside(sw_hrside_output,tlabel);
+print(gcf,'-dpng',fullfile(save_path,'switches_hrside'));
+saveas(gcf, fullfile(save_path,'switches_hrside'), 'fig');
+
+plot_switch_random(sw_random_output,tlabel,stats.rule_labels);
+print(gcf,'-dpng',fullfile(save_path,'switches_lateral_random'));
+saveas(gcf, fullfile(save_path,'switches_lateral_random'), 'fig');
+
+plot_switch_hrside_random(sw_hrside_random_output,tlabel);
+print(gcf,'-dsvg',fullfile(save_path,'switches_hrside_random'));
+saveas(gcf, fullfile(save_path,'switches_hrside_random'), 'fig');
+
+plot_switch_random_distn(sw_random_output,tlabel);
+print(gcf,'-dsvg',fullfile(save_path,'switches_random_distn'));
+print(gcf,'-dpng',fullfile(save_path,'switches_random_distn'));
+saveas(gcf, fullfile(save_path,'switches_random_distn'), 'fig');
+
+plot_lickrate_byTrialType(lick_trType);
+print(gcf,'-dpng',fullfile(save_path,'lickrates_byTrialType'));
+saveas(gcf, fullfile(save_path,'lickrates_byTrialType'), 'fig');
+
+plot_val_byTrialType(respTime_trType);
+print(gcf,'-dpng',fullfile(save_path,'rt_byTrialType'));
+saveas(gcf, fullfile(save_path,'rt_byTrialType'), 'fig');
+
+plot_val_byTrialType(iti_trType);
+print(gcf,'-dpng',fullfile(save_path,'iti_byTrialType'));
+saveas(gcf, fullfile(save_path,'iti_byTrialType'), 'fig');
+
+L2_ranges = [0 4;5 9;10 14;15 30];
+tlabel = ['a';'b'];
+ plot_binxaveragey_lesion([{sw_LRVsChoice,sw_LRVsChoice};...
+        {sw_LRVsChoice,sw_LRVsChoice}],tlabel, L2_ranges,save_path);
+print(gcf,'-dsvg',fullfile(save_path,'Lrandomsum'));
+print(gcf,'-dpng',fullfile(save_path,'Lrandomsum'));
+saveas(gcf, fullfile(save_path,'Lrandomsum'), 'fig');
+
+
+ L2_ranges = [0 4;5 9;10 14;15 30];
+tlabel = ['a';'b'];
+
+ plot_binxaveragey_lesion([{sw_LRVsMidpoint,sw_LRVsMidpoint};...
+        {sw_LRVsMidpoint,sw_LRVsMidpoint}],tlabel, L2_ranges,save_path);
+ print(gcf,'-dsvg',fullfile(save_path,'trialtomid'));
+print(gcf,'-dpng',fullfile(save_path,'trialtomid'));
+saveas(gcf, fullfile(save_path,'trialtomid'), 'fig');
+
+
+% plot_logreg(lreg,tlabel);
+% print(gcf,'-dpng',fullfile(save_path,'logreg'));    
+% saveas(gcf, fullfile(save_path,'logreg'), 'fig');
+
+%plot_logreg(lreg_LR,tlabel);
+%print(gcf,'-dpng',fullfile(save_path,'logreg_LR'));    
+%saveas(gcf, fullfile(save_path,'logreg_LR'), 'fig');
+
+close all
+disp (' Figures save in :')
+disp(['   ',save_path])

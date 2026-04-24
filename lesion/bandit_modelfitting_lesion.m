@@ -1,0 +1,56 @@
+function bandit_modelfitting_lesion(dataIndex, root_path)
+% % bandit_modelfitting_lesion%
+%PURPOSE:   Analysis of lesion data by model fittings.
+%AUTHORS:   H Atilgan 04/30/2020
+%
+%INPUT ARGUMENTS
+%   dataIndex:  the stats variable that contains choice/outcome information
+%   root_path:  text that describe the name of the model
+%
+%OUTPUT ARGUMENTS
+%
+
+%% create paths and folders
+simPath.root             = root_path;
+simPath.fig              = fullfile(root_path,'figs','lesion-sim');
+simPath.model_mat        = fullfile(root_path,'sim','mat_models');
+simPath.model_mat_lesion = fullfile(root_path,'sim','mat_models_lesion');
+simPath.stats_mat        = fullfile(root_path,'sim','mat_stats');
+simPath.sim_path         =  fullfile(root_path,'sim'); % path for both mat folder. 
+fnames = fieldnames(simPath);
+for k=1:numel(fnames)
+    temp = simPath.(fnames{k});
+    if ~exist(temp,'dir') % create folders
+        mkdir(temp);
+    end
+end
+
+%%  Model fitting - lesion data
+lesionSubset = ~isnan(dataIndex.Lesioned);  %post-lesion data
+bandit_fittingPerAnimal(dataIndex(lesionSubset,:),simPath.model_mat_lesion);
+bandit_fittingPerSession(dataIndex(lesionSubset,:),simPath.model_mat_lesion); % for all sessions % perSession was runned in master_behaviour code.
+
+flipLesionSideFittingParameters(simPath.sim_path)% only works for full bilateral model
+
+%% Compare parameters by each animal - UNILATERAL only (n=9 mice)  
+% This analysis only make sense for unilateral data as sample size =4 for
+% bilateral & saline groups.
+uniSubset = (ismember(dataIndex.LesionSide,[1 2])==1);  %unilateral lesion
+animalList = unique(dataIndex.Animal(uniSubset));
+model_type = 'belief_CK_varyingH_delta_bilateral'; %'belief_CK_bilateral';
+simPath.fig = fullfile(root_path,'figs','lesion-sim','animal-uni');
+lesion_compareParameters_unilateral(model_type,simPath ,animalList)
+
+%% Compare parameters by each session   
+model_type  = 'belief_CK_varyingH_delta_bilateral'; %'belief_CK_bilateral';
+simPath.fig = fullfile(root_path,'figs','lesion-sim','session-uni');
+lesion_compareParameters_session(model_type,simPath ,dataIndex,'unilateral')
+
+simPath.fig = fullfile(root_path,'figs','lesion-sim','session-bi');
+lesion_compareParameters_session(model_type,simPath ,dataIndex,'bilateral')
+
+simPath.fig = fullfile(root_path,'figs','lesion-sim','session-saline');
+lesion_compareParameters_session(model_type,simPath ,dataIndex,'saline')
+
+end
+
