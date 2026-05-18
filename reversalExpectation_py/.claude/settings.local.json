@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find \"C:\\\\Users\\\\cande\\\\Documents\\\\reversalExpectation_ML\\\\analysis\" -type f | head -20)",
+      "Read(//c/Users/cande/Documents/reversalExpectation_ML/analysis/**)",
+      "Bash(find \"C:\\\\Users\\\\cande\\\\Documents\\\\reversalExpectation_ML\\\\longitudinal\" -name \"*.m\" -type f)",
+      "Read(//c/Users/cande/Documents/reversalExpectation_ML/longitudinal/**)",
+      "Bash(find \"C:\\\\Users\\\\cande\\\\Documents\\\\reversalExpectation_ML\" -name \"funbelief.m\" -o -name \"funbelief_CK.m\" -o -name \"funbelief_CK_bilateral.m\" | head -20)",
+      "Read(//c/Users/cande/Documents/reversalExpectation_ML/**)",
+      "Bash(find \"C:\\\\Users\\\\cande\\\\Documents\" -name \"funbelief.m\" -o -name \"funbelief_CK.m\" -o -name \"funWSLS.m\" -o -name \"funQ_RPE.m\" 2>/dev/null)",
+      "Read(//c/Users/cande/Documents/**)",
+      "Bash(find \"C:\\\\Users\\\\cande\" -maxdepth 4 -type d -iname \"*model*\" -o -iname \"*fit*\" 2>/dev/null | head -20)",
+      "Read(//c/Users/cande/**)"
+    ]
+  }
+}
