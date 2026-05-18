@@ -3,3 +3,5 @@ reversal_expectation.egg-info/
 __pycache__/
 *.pyc
 data/
+analysis/
+figs/
