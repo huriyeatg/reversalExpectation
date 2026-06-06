@@ -200,6 +200,156 @@ def choice_switch_hrside_random(
     }
 
 
+def choice_lrandom_start(
+    stats: dict,
+    trials_back: int,
+    L1_ranges: np.ndarray,
+    L2_ranges: np.ndarray,
+) -> dict:
+    """
+    Like choice_switch_hrside_random() but aligns to the START of the
+    L_Random (random-bonus) period within each block, rather than to the
+    block switch (end of L_Random).
+
+    t=0  : first trial of the L_Random period (= trial L_C within the block).
+    t < 0: criterion-period trials.
+    t > 0: random-bonus trials.
+
+    Blocks are stratified by L_C (L1) and L_R (L2) ranges, same as
+    choice_switch_hrside_random().
+    """
+    L1_ranges = np.asarray(L1_ranges)
+    L2_ranges = np.asarray(L2_ranges)
+    if L1_ranges.shape[0] != L2_ranges.shape[0]:
+        raise ValueError(
+            "choice_lrandom_start: L1_ranges and L2_ranges must "
+            "have the same number of rows."
+        )
+
+    num_range    = L1_ranges.shape[0]
+    win          = 1 + 2 * trials_back
+    choseh       = np.zeros((win, num_range))
+    chosel       = np.zeros((win, num_range))
+    choseneither = np.zeros((win, num_range))
+    numtrans     = np.zeros(num_range, dtype=int)
+
+    block_length = stats["blockLength"]
+    block_ttc    = stats["blockTrialtoCrit"]
+    block_random = stats["blockTrialRandomAdded"]
+    c            = stats["c"]
+    hr_side      = stats["hr_side"]
+    n_trials     = len(c)
+
+    for i in range(len(block_length)):
+        if np.isnan(block_ttc[i]) or np.isnan(block_random[i]):
+            continue
+
+        in_range = (
+            (block_ttc[i]    >= L1_ranges[:, 0]) & (block_ttc[i]    <= L1_ranges[:, 1]) &
+            (block_random[i] >= L2_ranges[:, 0]) & (block_random[i] <= L2_ranges[:, 1])
+        )
+        if in_range.sum() != 1:
+            continue
+        r_idx = int(np.where(in_range)[0][0])
+
+        block_start   = int(np.sum(block_length[:i]))
+        lrandom_start = block_start + int(block_ttc[i])
+
+        t1 = lrandom_start - trials_back
+        t2 = lrandom_start + trials_back
+
+        if t1 < 0 or t2 >= n_trials:
+            continue
+
+        numtrans[r_idx] += 1
+        window_c    = c[t1: t2 + 1]
+        hr_at_align = hr_side[block_start]
+
+        choseh[:, r_idx]       += (window_c == hr_at_align)
+        chosel[:, r_idx]       += (window_c == -hr_at_align)
+        choseneither[:, r_idx] += np.isnan(window_c)
+
+    probh       = np.full((win, num_range), np.nan)
+    probl       = np.full((win, num_range), np.nan)
+    probneither = np.full((win, num_range), np.nan)
+    for j in range(num_range):
+        if numtrans[j] > 0:
+            probh[:, j]       = choseh[:, j]       / numtrans[j]
+            probl[:, j]       = chosel[:, j]       / numtrans[j]
+            probneither[:, j] = choseneither[:, j] / numtrans[j]
+
+    return {
+        "n":           np.arange(-trials_back, trials_back + 1),
+        "probh":       probh,
+        "probl":       probl,
+        "probneither": probneither,
+        "numtrans":    numtrans,
+        "numRange":    num_range,
+        "L1_ranges":   L1_ranges,
+        "L2_ranges":   L2_ranges,
+    }
+
+
+def lrandom_normalized_figure(df, n_bins=40, output_dir="figs"):
+    """
+    P(better/worse) en tiempo de bloque normalizado:
+      -1 = block start, 0 = L_Random start, 1 = switch.
+    Criterio -> [-1,0], L_Random -> [0,1], para superponer los 4 grupos de
+    L_Random pese a largos absolutos distintos. Referencia = lado bueno del
+    bloque actual (hr_side[block_start]). Excluye never-crit (ttc NaN) y L_Random==0.
+    """
+    import numpy as np, matplotlib.pyplot as plt
+    from pathlib import Path
+
+    L2 = [(0,4),(5,9),(10,14),(15,30)]
+    edges = np.linspace(-1, 1, n_bins+1); cen = (edges[:-1]+edges[1:])/2
+    acc = {g: {k: np.zeros(n_bins) for k in "bwmn"} for g in range(4)}
+
+    def tally(a, ph, ch, ref):
+        b = int(np.searchsorted(edges, ph, side="right") - 1)
+        if b < 0 or b >= n_bins: return
+        a["n"][b] += 1
+        if   np.isnan(ch): a["m"][b] += 1
+        elif ch == ref:    a["b"][b] += 1
+        else:              a["w"][b] += 1
+
+    for _, g in df.groupby(["animal", "session_file"], sort=False):
+        g = g.reset_index(drop=True)
+        blk    = g.groupby("block_idx", sort=True)
+        sizes  = blk.size().values.astype(int)
+        ttc    = blk.first()["block_trial_to_crit"].values.astype(float)
+        rnd    = blk.first()["block_trial_random_added"].values.astype(float)
+        c, hr  = g["choice"].values.astype(float), g["hr_side"].values.astype(float)
+        starts = np.concatenate([[0], np.cumsum(sizes)[:-1]])
+        last   = len(sizes) - 1
+        for i in range(len(sizes)):
+            if np.isnan(ttc[i]) or np.isnan(rnd[i]) or i == last: continue
+            L = int(rnd[i])
+            if L < 1: continue
+            gi = next((j for j,(lo,hi) in enumerate(L2) if lo <= L <= hi), None)
+            if gi is None: continue
+            bs, T = starts[i], int(ttc[i]); ls, be = bs+T, bs+sizes[i]
+            ref = hr[bs]
+            for k, t in enumerate(range(bs, ls)): tally(acc[gi], -1+(k+0.5)/T, c[t], ref)
+            for k, t in enumerate(range(ls, be)): tally(acc[gi],   (k+0.5)/L, c[t], ref)
+
+    oranges = ["#7a2e10","#c0531f","#e8821f","#f2b34d"]
+    purples = ["#3b0a6b","#6a2fb0","#9a7bd0","#c3b3e6"]
+    fig, ax = plt.subplots(figsize=(9,6))
+    for gi,(lo,hi) in enumerate(L2):
+        n  = acc[gi]["n"]; ok = n > 0
+        pb = np.where(ok, acc[gi]["b"]/np.where(ok,n,1), np.nan)
+        pw = np.where(ok, acc[gi]["w"]/np.where(ok,n,1), np.nan)
+        ax.plot(cen, pb, "-o", ms=3, color=oranges[gi], label=f"better $L_R$ {lo}-{hi}")
+        ax.plot(cen, pw, "-v", ms=3, color=purples[gi], label=f"worse $L_R$ {lo}-{hi}")
+    ax.axvline(0, ls="--", color="k", lw=1); ax.axvline(1, ls="-", color="k", lw=1.2)
+    ax.set_xlabel("Normalized block time  (-1 start, 0 $L_R$ start, 1 switch)")
+    ax.set_ylabel("Fraction of trials"); ax.set_xlim(-1.02,1.02); ax.set_ylim(0,1.05)
+    ax.legend(fontsize=7, ncol=2, loc="lower left"); fig.tight_layout()
+    if output_dir:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        fig.savefig(Path(output_dir)/"switches_lrandom_normalized.png", dpi=150, bbox_inches="tight")
+
 def choice_switch_random(
     stats: dict,
     trials_back: int,

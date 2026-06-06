@@ -164,5 +164,3 @@ def plot_switch_random(input_data, tlabel: str = "", output_dir: str = "figs") -
         out_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         print(f"Saved → {out_path}")
-
-    return fig

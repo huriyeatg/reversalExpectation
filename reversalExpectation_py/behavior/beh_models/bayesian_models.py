@@ -1,6 +1,6 @@
 """
-models.py
-=========
+bayesian_models.py
+==================
 Bayesian belief models for two-armed bandit reversal task.
 Port of funbelief.m / funbelief_CK.m (AC Kwan / H Atilgan lab).
 
@@ -16,6 +16,17 @@ Encoding convention (same as the rest of the pipeline)
 choice  : -1 = left,  1 = right,  NaN = miss
 reward  :  1 = rewarded,  0 = not rewarded,  NaN = miss
 rule    :  integer index mapping into REWARD_PROBS
+
+Likelihood layout
+-----------------
+The per-trial log-likelihood is computed by `belief_trial_loglikes` /
+`belief_ck_trial_loglikes`, which propagate the latent state (belief, and the
+choice kernel for CK) through *every* trial and return one log-likelihood per
+trial (NaN on miss). `belief_negloglike` / `belief_ck_negloglike` are thin
+wrappers that sum those values, optionally restricted to a subset of trials via
+`score_mask`. This keeps in-sample fitting identical to before while letting the
+cross-validation code score a held-out subset without breaking the sequential
+state propagation.
 """
 
 import warnings
@@ -78,12 +89,18 @@ def _reward_probs_for_n_rules(n_rules: int):
 
 
 # ---------------------------------------------------------------------------
-# Belief model — negative log-likelihood
+# Per-trial log-likelihoods (latent state propagates through ALL trials)
 # ---------------------------------------------------------------------------
 
-def belief_negloglike(params, c, r, n_rules: int = 2) -> float:
+def belief_trial_loglikes(params, c, r, n_rules: int = 2) -> np.ndarray:
     """
-    Negative log-likelihood for the belief model.
+    Per-trial log-likelihood of the observed choice under the belief model.
+
+    The belief propagates through every trial (including misses, which leave it
+    unchanged). The returned array has one entry per trial: log P(observed
+    choice) on choice trials, NaN on misses. Scoring a subset of trials is the
+    caller's job (e.g. via np.nansum over a mask) — this function never resets
+    the latent state, so a warm-up segment can precede the scored trials.
 
     Parameters
     ----------
@@ -93,35 +110,33 @@ def belief_negloglike(params, c, r, n_rules: int = 2) -> float:
     n_rules  : number of rules / hidden states (default 2)
     """
     H, beta = params
-    if H <= 0 or H >= 1 or beta <= 0:
-        return 1e9
-
     p_high, p_low = _reward_probs_for_n_rules(n_rules)
-    b   = 0.5
-    nll = 0.0
+    c = np.asarray(c, float)
+    r = np.asarray(r, float)
 
+    b  = 0.5
+    ll = np.full(len(c), np.nan)
     for t in range(len(c)):
         b_hat = _transition(b, H)
-        qdiff = _q_diff(b_hat, p_high, p_low)
-        p_l   = expit(beta * qdiff)
+        p_l   = expit(beta * _q_diff(b_hat, p_high, p_low))
 
         ct = c[t]
         if not np.isnan(ct):
             p_chosen = p_l if ct == -1 else (1.0 - p_l)
-            nll -= np.log(np.clip(p_chosen, 1e-15, 1.0 - 1e-15))
+            ll[t] = np.log(np.clip(p_chosen, 1e-15, 1.0 - 1e-15))
 
         b = _belief_update(b_hat, ct, r[t], p_high, p_low)
 
-    return nll
+    return ll
 
 
-# ---------------------------------------------------------------------------
-# Belief-CK model — negative log-likelihood
-# ---------------------------------------------------------------------------
-
-def belief_ck_negloglike(params, c, r, n_rules: int = 2) -> float:
+def belief_ck_trial_loglikes(params, c, r, n_rules: int = 2) -> np.ndarray:
     """
-    Negative log-likelihood for the belief + choice-kernel model.
+    Per-trial log-likelihood under the belief + choice-kernel model.
+
+    Both the belief and the choice kernel propagate through every trial (the
+    kernel only updates on choice trials, matching the original loop). Returns
+    one log-likelihood per trial (NaN on miss).
 
     Parameters
     ----------
@@ -131,25 +146,23 @@ def belief_ck_negloglike(params, c, r, n_rules: int = 2) -> float:
     n_rules  : number of rules (default 2)
     """
     H, beta, alpha_k, beta_k = params
-    if H <= 0 or H >= 1 or beta <= 0 or alpha_k < 0 or alpha_k > 1 or beta_k <= 0:
-        return 1e9
-
     p_high, p_low = _reward_probs_for_n_rules(n_rules)
-    b   = 0.5
-    ck  = np.zeros(2)   # [CK_left, CK_right]
-    nll = 0.0
+    c = np.asarray(c, float)
+    r = np.asarray(r, float)
 
+    b  = 0.5
+    ck = np.zeros(2)   # [CK_left, CK_right]
+    ll = np.full(len(c), np.nan)
     for t in range(len(c)):
         b_hat   = _transition(b, H)
         qdiff   = _q_diff(b_hat, p_high, p_low)
         ck_diff = ck[0] - ck[1]
-        logit   = beta * qdiff + beta_k * ck_diff
-        p_l     = expit(logit)
+        p_l     = expit(beta * qdiff + beta_k * ck_diff)
 
         ct = c[t]
         if not np.isnan(ct):
             p_chosen = p_l if ct == -1 else (1.0 - p_l)
-            nll -= np.log(np.clip(p_chosen, 1e-15, 1.0 - 1e-15))
+            ll[t] = np.log(np.clip(p_chosen, 1e-15, 1.0 - 1e-15))
 
         b = _belief_update(b_hat, ct, r[t], p_high, p_low)
 
@@ -161,7 +174,60 @@ def belief_ck_negloglike(params, c, r, n_rules: int = 2) -> float:
                 ck[1] = ck[1] + alpha_k * (1.0 - ck[1])
                 ck[0] = ck[0] * (1.0 - alpha_k)
 
-    return nll
+    return ll
+
+
+# ---------------------------------------------------------------------------
+# Negative log-likelihoods (thin wrappers; optional held-out scoring)
+# ---------------------------------------------------------------------------
+
+def belief_negloglike(params, c, r, n_rules: int = 2, score_mask=None) -> float:
+    """
+    Negative log-likelihood for the belief model.
+
+    With score_mask=None this is identical to summing the loss over all choice
+    trials (the original behaviour). When a boolean score_mask is given, only
+    the trials where the mask is True contribute to the sum, while the latent
+    state still propagates through every trial.
+
+    Parameters
+    ----------
+    params     : [H, beta]
+    c, r       : choices / rewards
+    n_rules    : number of rules (default 2)
+    score_mask : optional (n_trials,) bool array selecting scored trials
+    """
+    H, beta = params
+    if H <= 0 or H >= 1 or beta <= 0:
+        return 1e9
+
+    ll = belief_trial_loglikes(params, c, r, n_rules)
+    if score_mask is not None:
+        ll = ll[np.asarray(score_mask, bool)]
+    return float(-np.nansum(ll))
+
+
+def belief_ck_negloglike(params, c, r, n_rules: int = 2, score_mask=None) -> float:
+    """
+    Negative log-likelihood for the belief + choice-kernel model.
+
+    See `belief_negloglike` for the score_mask semantics.
+
+    Parameters
+    ----------
+    params     : [H, beta, alpha_k, beta_k]
+    c, r       : choices / rewards
+    n_rules    : number of rules (default 2)
+    score_mask : optional (n_trials,) bool array selecting scored trials
+    """
+    H, beta, alpha_k, beta_k = params
+    if H <= 0 or H >= 1 or beta <= 0 or alpha_k < 0 or alpha_k > 1 or beta_k <= 0:
+        return 1e9
+
+    ll = belief_ck_trial_loglikes(params, c, r, n_rules)
+    if score_mask is not None:
+        ll = ll[np.asarray(score_mask, bool)]
+    return float(-np.nansum(ll))
 
 
 # ---------------------------------------------------------------------------
@@ -169,9 +235,15 @@ def belief_ck_negloglike(params, c, r, n_rules: int = 2) -> float:
 # ---------------------------------------------------------------------------
 
 def fit_belief(c, r, n_rules: int = 2, n_restarts: int = 5,
-               rng=None) -> dict:
+               rng=None, score_mask=None) -> dict:
     """
     Fit the belief model to observed choices and rewards.
+
+    With score_mask=None this fits on all choice trials (the original
+    behaviour). With a boolean score_mask, the negative log-likelihood is
+    minimised over the scored trials only, while the latent state still
+    propagates through every trial (used for cross-validation: pass the train
+    mask here). The returned BIC / nlike are computed over the scored trials.
 
     Returns
     -------
@@ -181,13 +253,16 @@ def fit_belief(c, r, n_rules: int = 2, n_restarts: int = 5,
     if rng is None:
         rng = np.random.default_rng()
     c, r = np.asarray(c, float), np.asarray(r, float)
-    n_obs = int(np.sum(~np.isnan(c)))
+    if score_mask is None:
+        n_obs = int(np.sum(~np.isnan(c)))
+    else:
+        n_obs = int(np.sum(~np.isnan(c) & np.asarray(score_mask, bool)))
 
     best_nll, best_par = np.inf, None
     for _ in range(n_restarts):
         x0  = [rng.uniform(0.01, 0.49), rng.uniform(0.5, 15.0)]
         res = minimize(
-            belief_negloglike, x0, args=(c, r, n_rules),
+            belief_negloglike, x0, args=(c, r, n_rules, score_mask),
             method="L-BFGS-B",
             bounds=[(1e-6, 1.0 - 1e-6), (1e-3, 100.0)],
         )
@@ -205,9 +280,11 @@ def fit_belief(c, r, n_rules: int = 2, n_restarts: int = 5,
 
 
 def fit_belief_ck(c, r, n_rules: int = 2, n_restarts: int = 5,
-                  rng=None) -> dict:
+                  rng=None, score_mask=None) -> dict:
     """
     Fit the belief-CK model to observed choices and rewards.
+
+    See `fit_belief` for the score_mask semantics.
 
     Returns
     -------
@@ -217,7 +294,10 @@ def fit_belief_ck(c, r, n_rules: int = 2, n_restarts: int = 5,
     if rng is None:
         rng = np.random.default_rng()
     c, r = np.asarray(c, float), np.asarray(r, float)
-    n_obs = int(np.sum(~np.isnan(c)))
+    if score_mask is None:
+        n_obs = int(np.sum(~np.isnan(c)))
+    else:
+        n_obs = int(np.sum(~np.isnan(c) & np.asarray(score_mask, bool)))
 
     best_nll, best_par = np.inf, None
     for _ in range(n_restarts):
@@ -228,7 +308,7 @@ def fit_belief_ck(c, r, n_rules: int = 2, n_restarts: int = 5,
             rng.uniform(0.5,  10.0),
         ]
         res = minimize(
-            belief_ck_negloglike, x0, args=(c, r, n_rules),
+            belief_ck_negloglike, x0, args=(c, r, n_rules, score_mask),
             method="L-BFGS-B",
             bounds=[
                 (1e-6, 1.0 - 1e-6),   # H

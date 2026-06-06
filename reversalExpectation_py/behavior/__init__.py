@@ -7,13 +7,14 @@ from .choice_switch           import (
     choice_switch_hrside_random,
     choice_switch_random,
     choice_switch_stats_random,
+    choice_lrandom_start,
 )
 from .logistic_regression     import logreg_RCUC, logreg_RCUC_LR
 from .changepoint_probability import changepoint_probability
 from .trial_type_stats           import get_lickrate_by_trial_type, get_val_by_trial_type
 from .plot_switch_hrside_random  import plot_switch_hrside_random
 from .plot_switch_random         import plot_switch_random
-from .models import (
+from .beh_models.bayesian_models import (
     belief_negloglike, belief_ck_negloglike,
     fit_belief, fit_belief_ck,
     simulate_belief, simulate_belief_ck,

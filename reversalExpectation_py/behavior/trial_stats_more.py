@@ -164,13 +164,12 @@ def get_trial_stats_more(stats: dict) -> dict:
         # Trials-to-criterion = position (1-indexed) of 10th hr-side choice
         better_idx = np.where(c_blk == hr_side_b)[0]
         if len(better_idx) >= 10:
-            block_trial_to_crit[b] = float(better_idx[9] + 1)
+            block_trial_to_crit[b]      = float(better_idx[9] + 1)
+            block_trial_random_added[b] = max(0.0, block_length[b] - block_trial_to_crit[b])
         else:
-            block_trial_to_crit[b] = float(len(c_blk))
-
-        block_trial_random_added[b] = max(
-            0.0, block_length[b] - block_trial_to_crit[b]
-        )
+            # nunca llegó a 10 elecciones buenas → criterio/random indefinidos, excluir
+            block_trial_to_crit[b]      = np.nan
+            block_trial_random_added[b] = np.nan
 
     # ------------------------------------------------------------------
     # 3. Trial-level hr_side
