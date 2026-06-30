@@ -3,3 +3,8 @@ pandas
 scipy
 matplotlib
 scikit-learn
+joblib
+pybads        # BADS optimizer for the belief models (optimizer="lbfgs" falls back to scipy)
+statsmodels   # optional: GEE stats in alternation_after_correct_figure
+# GLM-HMM (run_glmhmm.py) additionally needs the zashwood/ssm fork, installed in a
+# separate `ssm` conda env: pip install git+https://github.com/zashwood/ssm.git
