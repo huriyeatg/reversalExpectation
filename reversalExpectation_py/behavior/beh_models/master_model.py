@@ -13,10 +13,7 @@ on/off is a one-line edit to MODELS — nothing else changes, and the entry poin
 Each model is described by a ModelSpec:
     name          : str
     fit_fn        : fit_fn(*inputs, n_restarts, rng, score_mask=None) -> result dict
-                    (keys: fitpar, negloglike, bic, nlike). If the fit function
-                    also accepts an `optimizer` keyword (the belief models do),
-                    the registry passes the module-level OPTIMIZER through to it;
-                    fit functions without that keyword are called unchanged.
+                    (keys: fitpar, negloglike, bic, nlike)
     loglike_fn    : loglike_fn(params, *inputs) -> per-trial log-likelihood array
                     (NaN on miss); the latent state propagates through every trial
     param_labels  : list[str], names of the fitted parameters (order matches fitpar)
@@ -33,7 +30,6 @@ a single full-session pass (warmed up through the preceding trials).
 import inspect
 import warnings
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 from typing import Callable, List
 
@@ -46,7 +42,6 @@ from behavior.beh_models.bayesian_models import (
     fit_belief_ck,
     belief_trial_loglikes,
     belief_ck_trial_loglikes,
-    _HAVE_BADS,
 )
 # Re-exported so callers can reach the hazard diagnostic through this module too.
 from behavior.beh_models.belief_vhr import (
@@ -80,41 +75,6 @@ class ModelSpec:
     prepare: Callable = _prepare_choice_reward
 
 
-@lru_cache(maxsize=None)
-def _accepts_optimizer(fit_fn: Callable) -> bool:
-    """True if fit_fn takes an `optimizer` keyword (cached per function)."""
-    try:
-        return "optimizer" in inspect.signature(fit_fn).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-def _fit_kwargs(fit_fn, n_restarts, rng, score_mask=None, optimizer=None):
-    """Assemble the keyword args for a fit_fn call, adding `optimizer` only when
-    the fit function accepts it (keeps the registry generic across model types)."""
-    kw = {"n_restarts": n_restarts, "rng": rng}
-    if score_mask is not None:
-        kw["score_mask"] = score_mask
-    if optimizer is not None and _accepts_optimizer(fit_fn):
-        kw["optimizer"] = optimizer
-    return kw
-
-
-def _require_optimizer(optimizer: str):
-    """Fail fast if BADS is requested but pybads is missing.
-
-    Without this, every per-session fit would raise, get caught, warn, and skip
-    — leaving an empty model_fits.csv behind a wall of warnings. Better to stop
-    immediately with one clear message.
-    """
-    if optimizer == "bads" and not _HAVE_BADS:
-        raise ImportError(
-            "optimizer='bads' but pybads is not installed. Install it with "
-            "`pip install pybads`, or set OPTIMIZER='lbfgs' in master_model.py "
-            "(or pass optimizer='lbfgs')."
-        )
-
-
 # The active models. Comment/uncomment lines to toggle which models are run.
 MODELS: List[ModelSpec] = [
     ModelSpec("belief",    fit_belief,    belief_trial_loglikes, ["H", "beta"]),
@@ -126,15 +86,12 @@ MODELS: List[ModelSpec] = [
 
 
 # ===========================================================================
-# Cross-validation defaults  (configured here, not in master_bandit.py)
+# Cross-validation defaults
 # ===========================================================================
 
 CV_SCHEMES = ["temporal"]   # any of: "temporal", "block", "forward"
 CV_N_RESTARTS = 5           # optimizer restarts per fit (lower = faster)
 CV_N_JOBS = -1              # CPU cores (-1 = all, 1 = serial)
-OPTIMIZER = "bads"          # "bads" (PyBADS, as in Murphy et al.) or "lbfgs"
-                            # (scipy fallback). Passed to fit functions that
-                            # accept an `optimizer` kwarg.
 
 
 # ===========================================================================
@@ -142,30 +99,27 @@ OPTIMIZER = "bads"          # "bads" (PyBADS, as in Murphy et al.) or "lbfgs"
 # ===========================================================================
 
 def fit_models_session(df_ses: pd.DataFrame, models=None, n_restarts: int = 5,
-                       rng=None, optimizer: str = None) -> dict:
+                       rng=None) -> dict:
     """Fit every registered model to one session. Returns {name: result dict|None}."""
     models = MODELS if models is None else models
-    optimizer = OPTIMIZER if optimizer is None else optimizer
     out = {}
     for spec in models:
         try:
-            kw = _fit_kwargs(spec.fit_fn, n_restarts, rng, optimizer=optimizer)
-            out[spec.name] = spec.fit_fn(*spec.prepare(df_ses), **kw)
+            out[spec.name] = spec.fit_fn(*spec.prepare(df_ses),
+                                         n_restarts=n_restarts, rng=rng)
         except Exception as e:
             warnings.warn(f"Model fitting failed ({spec.name}): {e}")
             out[spec.name] = None
     return out
 
 
-def _fit_one_session(animal, ses_file, df_ses, models, n_restarts, seed_seq,
-                     optimizer="bads"):
+def _fit_one_session(animal, ses_file, df_ses, models, n_restarts, seed_seq):
     """Worker: fit every model for one session; returns a list of row dicts."""
     rng = np.random.default_rng(seed_seq)
     rows = []
     for spec in models:
         try:
-            kw = _fit_kwargs(spec.fit_fn, n_restarts, rng, optimizer=optimizer)
-            res = spec.fit_fn(*spec.prepare(df_ses), **kw)
+            res = spec.fit_fn(*spec.prepare(df_ses), n_restarts=n_restarts, rng=rng)
         except Exception as e:
             warnings.warn(f"Model fitting failed ({spec.name}): {e}")
             continue
@@ -193,7 +147,6 @@ def fit_models(
     verbose: bool = True,
     output_dir: str = "analysis",
     seed: int = 42,
-    optimizer: str = None,
 ) -> pd.DataFrame:
     """
     Fit every registered model to every session in df (in parallel across cores).
@@ -203,14 +156,11 @@ def fit_models(
     BIC, nlike) and saves analysis/model_fits.csv when output_dir is given.
     """
     models = MODELS if models is None else models
-    optimizer = OPTIMIZER if optimizer is None else optimizer
-    _require_optimizer(optimizer)
     sessions = list(df.groupby(["animal", "session_file"], sort=False))
     seeds = np.random.SeedSequence(seed).spawn(len(sessions))
 
     results = Parallel(n_jobs=n_jobs, verbose=(10 if verbose else 0))(
-        delayed(_fit_one_session)(animal, ses_file, df_ses, models, n_restarts, ss,
-                                  optimizer)
+        delayed(_fit_one_session)(animal, ses_file, df_ses, models, n_restarts, ss)
         for ss, ((animal, ses_file), df_ses) in zip(seeds, sessions)
     )
     rows = [row for session_rows in results for row in session_rows]
@@ -227,6 +177,119 @@ def fit_models(
 
 # Backwards-compatible alias (the pipeline used to be belief-specific).
 model_fit_belief = fit_models
+
+
+# ===========================================================================
+# Per-animal fitting (Murphy et al.: sessions concatenated per animal, the
+# latent state reset to its prior at each session boundary). This is an ADD-ON
+# mode -- the per-session fit_models above is untouched. Only models whose
+# fit_fn accepts `session_starts` (belief, belief_ck) are fit here; models that
+# don't (e.g. belief_vhr, whose per-session latent inputs aren't concatenation-
+# aware) are skipped with a note.
+# ===========================================================================
+
+def _concat_animal(df_animal: pd.DataFrame):
+    """Concatenate one animal's sessions in temporal order (by date_number).
+
+    Returns (c, r, n_rules, session_starts), where session_starts are the trial
+    indices at which each session begins in the concatenated arrays.
+    """
+    if "date_number" in df_animal.columns:
+        order = (df_animal.groupby("session_file")["date_number"].first()
+                 .sort_values().index.tolist())
+    else:                                   # fallback: order of appearance
+        order = list(dict.fromkeys(df_animal["session_file"]))
+
+    c_parts, r_parts, starts, n = [], [], [], 0
+    n_rules = int(df_animal["n_rules"].iloc[0])
+    for ses in order:
+        d = df_animal[df_animal["session_file"] == ses]
+        if "trial_idx" in d.columns:
+            d = d.sort_values("trial_idx")
+        starts.append(n)
+        c_parts.append(d["choice"].values.astype(float))
+        r_parts.append(d["rewarded"].values.astype(float))
+        n += len(d)
+    return (np.concatenate(c_parts), np.concatenate(r_parts), n_rules, starts)
+
+
+def _fit_one_animal(animal, df_animal, models, n_restarts, optimizer, seed_seq):
+    """Worker: fit each session_starts-aware model for one animal."""
+    rng = np.random.default_rng(seed_seq)
+    c, r, n_rules, starts = _concat_animal(df_animal)
+    n_ses = len(starts)
+    rows = []
+    for spec in models:
+        params = inspect.signature(spec.fit_fn).parameters
+        if "session_starts" not in params:
+            continue                        # not concatenation-aware -> skip
+        kw = dict(n_restarts=n_restarts, rng=rng, session_starts=starts)
+        if "optimizer" in params:
+            kw["optimizer"] = optimizer
+        try:
+            res = spec.fit_fn(c, r, n_rules, **kw)
+        except Exception as e:
+            warnings.warn(f"Per-animal fit failed ({spec.name}, {animal}): {e}")
+            continue
+        if res is None or res.get("fitpar") is None:
+            continue
+        row = {
+            "animal":     animal,
+            "n_sessions": n_ses,
+            "n_trials":   int(np.sum(~np.isnan(c))),
+            "model":      spec.name,
+            "negloglike": res["negloglike"],
+            "bic":        res["bic"],
+            "nlike":      res["nlike"],
+        }
+        for lbl, val in zip(spec.param_labels, res["fitpar"]):
+            row[f"par_{lbl}"] = float(val)
+        rows.append(row)
+    return rows
+
+
+def fit_models_per_animal(
+    df: pd.DataFrame,
+    models=None,
+    n_restarts: int = 5,
+    n_jobs: int = -1,
+    optimizer: str = "lbfgs",
+    verbose: bool = True,
+    output_dir: str = "analysis",
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Fit each session_starts-aware model once per ANIMAL (Murphy et al. style:
+    sessions concatenated in temporal order, latent state reset to prior at each
+    session boundary). One row per animal x model. Saves
+    analysis/model_fits_per_animal.csv when output_dir is given.
+
+    optimizer : "lbfgs" (default) or "bads" (passed to fit functions that accept
+        it; falls back to L-BFGS-B if pybads is not installed).
+    """
+    models = MODELS if models is None else models
+    animals = list(df.groupby("animal", sort=False))
+    seeds = np.random.SeedSequence(seed).spawn(len(animals))
+
+    skipped = [s.name for s in models
+               if "session_starts" not in inspect.signature(s.fit_fn).parameters]
+    if skipped and verbose:
+        print(f"[per-animal] skipping models without session_starts support: {skipped}")
+
+    results = Parallel(n_jobs=n_jobs, verbose=(10 if verbose else 0))(
+        delayed(_fit_one_animal)(animal, df_animal, models, n_restarts, optimizer, ss)
+        for ss, (animal, df_animal) in zip(seeds, animals)
+    )
+    rows = [row for animal_rows in results for row in animal_rows]
+    fit_df = pd.DataFrame(rows)
+
+    if output_dir and len(fit_df):
+        out = Path(output_dir) / "model_fits_per_animal.csv"
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        fit_df.to_csv(out, index=False)
+        print(f"Saved → {out}")
+
+    return fit_df
 
 
 # ===========================================================================
@@ -299,7 +362,6 @@ def cross_validate_models_session(
     n_restarts: int = 5,
     min_train_blocks: int = 1,
     rng=None,
-    optimizer: str = None,
 ) -> dict:
     """
     Cross-validate every registered model on one session.
@@ -311,7 +373,6 @@ def cross_validate_models_session(
     cv_nlike.
     """
     models = MODELS if models is None else models
-    optimizer = OPTIMIZER if optimizer is None else optimizer
     if rng is None:
         rng = np.random.default_rng()
 
@@ -325,9 +386,8 @@ def cross_validate_models_session(
         n_test = 0
         for train_mask, test_mask in folds:
             try:
-                kw = _fit_kwargs(spec.fit_fn, n_restarts, rng,
-                                 score_mask=train_mask, optimizer=optimizer)
-                res = spec.fit_fn(*inputs, **kw)
+                res = spec.fit_fn(*inputs, n_restarts=n_restarts, rng=rng,
+                                  score_mask=train_mask)
             except Exception as e:
                 warnings.warn(f"CV fit failed ({spec.name}): {e}")
                 continue
@@ -349,13 +409,12 @@ def cross_validate_models_session(
 
 
 def _cv_one_session(animal, ses_file, df_ses, models, scheme, test_frac,
-                    n_restarts, min_train_blocks, seed_seq, optimizer="bads"):
+                    n_restarts, min_train_blocks, seed_seq):
     """Worker: cross-validate every model for one session; returns row dicts."""
     rng = np.random.default_rng(seed_seq)
     res = cross_validate_models_session(
         df_ses, models=models, scheme=scheme, test_frac=test_frac,
         n_restarts=n_restarts, min_train_blocks=min_train_blocks, rng=rng,
-        optimizer=optimizer,
     )
     return [{"animal": animal, "session_file": ses_file, **d} for d in res.values()]
 
@@ -371,7 +430,6 @@ def cross_validate_models(
     verbose: bool = True,
     output_dir: str = "analysis",
     seed: int = 42,
-    optimizer: str = None,
 ) -> pd.DataFrame:
     """
     Cross-validate every registered model for every session in df (in parallel).
@@ -380,15 +438,12 @@ def cross_validate_models(
     saves analysis/model_cv.csv when output_dir is given.
     """
     models = MODELS if models is None else models
-    optimizer = OPTIMIZER if optimizer is None else optimizer
-    _require_optimizer(optimizer)
     sessions = list(df.groupby(["animal", "session_file"], sort=False))
     seeds = np.random.SeedSequence(seed).spawn(len(sessions))
 
     results = Parallel(n_jobs=n_jobs, verbose=(10 if verbose else 0))(
         delayed(_cv_one_session)(animal, ses_file, df_ses, models, scheme,
-                                 test_frac, n_restarts, min_train_blocks, ss,
-                                 optimizer)
+                                 test_frac, n_restarts, min_train_blocks, ss)
         for ss, ((animal, ses_file), df_ses) in zip(seeds, sessions)
     )
     rows = [row for session_rows in results for row in session_rows]
@@ -417,15 +472,14 @@ def run_models(
     make_plots: bool = True,
     verbose: bool = True,
     seed: int = 42,
-    optimizer: str = None,
 ):
     """
     Fit and cross-validate every registered model, save the CSVs, print a
     summary, and (optionally) draw the model-comparison figures.
 
-    Which models run is controlled by MODELS; the cross-validation schemes,
-    speed knobs and optimizer default to the CV_* / OPTIMIZER constants in this
-    module. This is the only function master_bandit.py needs to call.
+    Which models run is controlled by MODELS; the cross-validation schemes and
+    speed knobs default to the CV_* constants in this module. This is the only
+    function master_bandit.py needs to call.
 
     Returns (fit_df, cv_df).
     """
@@ -433,17 +487,13 @@ def run_models(
     schemes = list(CV_SCHEMES if schemes is None else schemes)
     n_restarts = CV_N_RESTARTS if n_restarts is None else n_restarts
     n_jobs = CV_N_JOBS if n_jobs is None else n_jobs
-    optimizer = OPTIMIZER if optimizer is None else optimizer
-    _require_optimizer(optimizer)   # stop now if BADS requested but unavailable
 
-    print("Active models: " + ", ".join(s.name for s in models)
-          + f"  |  optimizer: {optimizer}")
+    print("Active models: " + ", ".join(s.name for s in models))
 
     # In-sample fit -> analysis/model_fits.csv
     print("\nIn-sample fit...")
     fit_df = fit_models(df, models=models, n_restarts=n_restarts, n_jobs=n_jobs,
-                        verbose=verbose, output_dir=output_dir, seed=seed,
-                        optimizer=optimizer)
+                        verbose=verbose, output_dir=output_dir, seed=seed)
 
     # Cross-validation across schemes -> analysis/model_cv.csv
     cv_parts = []
@@ -451,8 +501,7 @@ def run_models(
         print(f"\nCross-validation (scheme = {scheme})...")
         cv_parts.append(cross_validate_models(
             df, models=models, scheme=scheme, n_restarts=n_restarts,
-            n_jobs=n_jobs, verbose=verbose, output_dir=None, seed=seed,
-            optimizer=optimizer))
+            n_jobs=n_jobs, verbose=verbose, output_dir=None, seed=seed))
     cv_df = pd.concat(cv_parts, ignore_index=True) if cv_parts else pd.DataFrame()
     if output_dir and len(cv_df):
         out = Path(output_dir) / "model_cv.csv"

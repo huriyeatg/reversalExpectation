@@ -6,17 +6,6 @@ Port of funbelief.m / funbelief_CK.m (AC Kwan / H Atilgan lab).
 
 Reference: Murphy et al. 2024 eLife, Figure 3, Methods pp. 21-22.
 
-The belief transition (switch) step follows Murphy Eq. (7): the belief leaks
-toward the uniform prior at rate H (reset-to-prior), NOT a symmetric two-state
-flip. See `_transition` for details. The Bayes outcome update (Eq. 8), expected
-reward (Eq. 9), softmax (Eqs. 3/5) and BIC (Eq. 10) match the paper as well.
-
-Trial loop order also matches the paper: the choice is made on the belief (and
-choice kernel) carried from the end of the previous trial; then, at the end of
-the trial, the belief is transitioned (Eq. 7) and Bayes-updated with the
-outcome (Eq. 8), and the choice kernel is updated. Fitting uses BADS (Acerbi &
-Ma 2017) by default, as in Murphy et al.
-
 Models
 ------
 belief      (2 params): H, beta
@@ -47,47 +36,6 @@ from scipy.special import expit  # numerically stable sigmoid
 
 from preprocessing.presentation_codes import REWARD_PROBS
 
-# BADS (Bayesian Adaptive Direct Search; Acerbi & Ma 2017) is the optimiser
-# Murphy et al. used. PyBADS is its Python port. Imported lazily so the module
-# still loads in environments without it (use optimizer="lbfgs" there).
-try:
-    from pybads import BADS as _BADS
-    _HAVE_BADS = True
-except Exception:                       # pragma: no cover
-    _BADS = None
-    _HAVE_BADS = False
-
-
-import os
-import contextlib
-
-def _run_bads(fun, x0, lb, ub, plb, pub):
-    """
-    Minimise `fun` with PyBADS from start point x0 (Murphy et al.'s optimiser).
-
-    lb/ub are hard bounds; plb/pub are plausible bounds. x0 is clipped strictly
-    inside the plausible box to avoid pybads start-point corrections. PyBADS'
-    console messages are silenced (display is off and stdout/stderr are
-    redirected during the run); exceptions still propagate. Returns (x_best, fval).
-    """
-    if not _HAVE_BADS:
-        raise ImportError(
-            "pybads is not installed. Install it with `pip install pybads`, "
-            "or pass optimizer='lbfgs' to use scipy L-BFGS-B instead."
-        )
-    lb, ub = np.asarray(lb, float), np.asarray(ub, float)
-    plb, pub = np.asarray(plb, float), np.asarray(pub, float)
-    margin = 1e-3 * (pub - plb)
-    x0 = np.clip(np.asarray(x0, float), plb + margin, pub - margin)
-    options = {"display": "off", "uncertainty_handling": False}
-    with open(os.devnull, "w") as _dev, \
-            contextlib.redirect_stdout(_dev), contextlib.redirect_stderr(_dev), \
-            warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        bads = _BADS(fun, x0, lb, ub, plb, pub, options=options)
-        res = bads.optimize()
-    return np.asarray(res["x"], float).ravel(), float(res["fval"])
-
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -99,21 +47,16 @@ def _get_reward_probs(n_rules: int):
 
 
 def _transition(b: float, H: float, prior: float = 0.5) -> float:
-    """
-    Belief transition (switch) step. Matches Murphy et al. 2024, Eq. (7):
+    """Belief transition for the hazard step (Murphy et al. 2024, Eq. 7).
 
-        rho' propto rho * (1 - H) + prior * H
-
-    i.e. the belief leaks toward the uniform prior (prior = 0.5) at rate H.
-    The two states rho_L70 and rho_L10 each get a `prior * H` term, so the
-    result is already normalised (retained terms sum to 1 - H, leak terms sum
-    to H). This is a "reset-to-prior" jump process: with probability H the
-    hidden state is redrawn from the prior; with probability 1 - H it persists.
-
-    NOTE: this is NOT the symmetric two-state flip `b*(1-H) + (1-b)*H`. Under
-    the flip form the same H decays toward 0.5 about twice as fast, which biases
-    the fitted H downward relative to the values reported in Murphy et al.
-    (their best-fit H ~= 0.32). `b = prior` is the fixed point of both forms.
+    The belief leaks toward the uniform prior at rate H:
+        b <- b * (1 - H) + prior * H
+    This matches the preprint, where rho_L10 and rho_L70 each relax toward
+    rho_prior = 0.5 with weight H before renormalising (the renormalisation is a
+    no-op because both leak toward the same prior and already sum to 1). It is
+    NOT the symmetric two-state Chapman-Kolmogorov swap b <- b*(1-H) + (1-b)*H,
+    which pulls the belief toward the complementary state and erodes it faster /
+    asymmetrically, giving different switch-aligned curves for the same H.
     """
     return b * (1.0 - H) + prior * H
 
@@ -159,7 +102,8 @@ def _reward_probs_for_n_rules(n_rules: int):
 # Per-trial log-likelihoods (latent state propagates through ALL trials)
 # ---------------------------------------------------------------------------
 
-def belief_trial_loglikes(params, c, r, n_rules: int = 2) -> np.ndarray:
+def belief_trial_loglikes(params, c, r, n_rules: int = 2,
+                          session_starts=None) -> np.ndarray:
     """
     Per-trial log-likelihood of the observed choice under the belief model.
 
@@ -171,39 +115,44 @@ def belief_trial_loglikes(params, c, r, n_rules: int = 2) -> np.ndarray:
 
     Parameters
     ----------
-    params   : [H, beta]
-    c        : (n_trials,) choices  (-1/1/NaN)
-    r        : (n_trials,) rewards  (0/1/NaN)
-    n_rules  : number of rules / hidden states (default 2)
+    params         : [H, beta]
+    c              : (n_trials,) choices  (-1/1/NaN)
+    r              : (n_trials,) rewards  (0/1/NaN)
+    n_rules        : number of rules / hidden states (default 2)
+    session_starts : optional iterable of trial indices where a new session
+                     begins (Murphy et al.: the prior is reset to 0.5 at the
+                     start of each session). When None (default), the belief is
+                     initialised once and never reset — the original behaviour,
+                     correct for per-session fitting where each call is one
+                     session. Pass it only when concatenating sessions per
+                     animal.
     """
     H, beta = params
     p_high, p_low = _reward_probs_for_n_rules(n_rules)
     c = np.asarray(c, float)
     r = np.asarray(r, float)
+    resets = set() if session_starts is None else {int(i) for i in session_starts}
 
     b  = 0.5
     ll = np.full(len(c), np.nan)
     for t in range(len(c)):
-        # Decision uses the belief carried from the end of the previous trial
-        # (Murphy et al.: action selection on the current belief, then the
-        # end-of-trial update). For t = 0 this is the uniform prior.
-        p_l = expit(beta * _q_diff(b, p_high, p_low))
+        if t in resets:
+            b = 0.5                       # new session: reset belief to prior
+        b_hat = _transition(b, H)
+        p_l   = expit(beta * _q_diff(b_hat, p_high, p_low))
 
         ct = c[t]
         if not np.isnan(ct):
             p_chosen = p_l if ct == -1 else (1.0 - p_l)
             ll[t] = np.log(np.clip(p_chosen, 1e-15, 1.0 - 1e-15))
 
-        # End-of-trial belief update, Murphy Eq. (7) then Eq. (8): first the
-        # switch transition, then the Bayesian outcome inference. On a miss
-        # _belief_update returns the transitioned belief unchanged.
-        b_pred = _transition(b, H)
-        b = _belief_update(b_pred, ct, r[t], p_high, p_low)
+        b = _belief_update(b_hat, ct, r[t], p_high, p_low)
 
     return ll
 
 
-def belief_ck_trial_loglikes(params, c, r, n_rules: int = 2) -> np.ndarray:
+def belief_ck_trial_loglikes(params, c, r, n_rules: int = 2,
+                             session_starts=None) -> np.ndarray:
     """
     Per-trial log-likelihood under the belief + choice-kernel model.
 
@@ -213,23 +162,30 @@ def belief_ck_trial_loglikes(params, c, r, n_rules: int = 2) -> np.ndarray:
 
     Parameters
     ----------
-    params   : [H, beta, alpha_k, beta_k]
-    c        : (n_trials,) choices
-    r        : (n_trials,) rewards
-    n_rules  : number of rules (default 2)
+    params         : [H, beta, alpha_k, beta_k]
+    c              : (n_trials,) choices
+    r              : (n_trials,) rewards
+    n_rules        : number of rules (default 2)
+    session_starts : optional trial indices where a new session begins; the
+                     belief AND the choice kernel are reset there (Murphy et
+                     al.: uniform prior at each session start). None (default)
+                     = never reset, the original per-session behaviour.
     """
     H, beta, alpha_k, beta_k = params
     p_high, p_low = _reward_probs_for_n_rules(n_rules)
     c = np.asarray(c, float)
     r = np.asarray(r, float)
+    resets = set() if session_starts is None else {int(i) for i in session_starts}
 
     b  = 0.5
     ck = np.zeros(2)   # [CK_left, CK_right]
     ll = np.full(len(c), np.nan)
     for t in range(len(c)):
-        # Decision uses the belief and choice kernel carried from the end of the
-        # previous trial (Murphy order).
-        qdiff   = _q_diff(b, p_high, p_low)
+        if t in resets:
+            b = 0.5                       # new session: reset belief and kernel
+            ck = np.zeros(2)
+        b_hat   = _transition(b, H)
+        qdiff   = _q_diff(b_hat, p_high, p_low)
         ck_diff = ck[0] - ck[1]
         p_l     = expit(beta * qdiff + beta_k * ck_diff)
 
@@ -238,11 +194,8 @@ def belief_ck_trial_loglikes(params, c, r, n_rules: int = 2) -> np.ndarray:
             p_chosen = p_l if ct == -1 else (1.0 - p_l)
             ll[t] = np.log(np.clip(p_chosen, 1e-15, 1.0 - 1e-15))
 
-        # End-of-trial belief update: transition (Eq. 7) then Bayes (Eq. 8).
-        b_pred = _transition(b, H)
-        b = _belief_update(b_pred, ct, r[t], p_high, p_low)
+        b = _belief_update(b_hat, ct, r[t], p_high, p_low)
 
-        # End-of-trial choice-kernel update (only on choice trials).
         if not np.isnan(ct):
             if ct == -1:                       # chose left
                 ck[0] = ck[0] + alpha_k * (1.0 - ck[0])
@@ -258,7 +211,8 @@ def belief_ck_trial_loglikes(params, c, r, n_rules: int = 2) -> np.ndarray:
 # Negative log-likelihoods (thin wrappers; optional held-out scoring)
 # ---------------------------------------------------------------------------
 
-def belief_negloglike(params, c, r, n_rules: int = 2, score_mask=None) -> float:
+def belief_negloglike(params, c, r, n_rules: int = 2, score_mask=None,
+                      session_starts=None) -> float:
     """
     Negative log-likelihood for the belief model.
 
@@ -278,13 +232,14 @@ def belief_negloglike(params, c, r, n_rules: int = 2, score_mask=None) -> float:
     if H <= 0 or H >= 1 or beta <= 0:
         return 1e9
 
-    ll = belief_trial_loglikes(params, c, r, n_rules)
+    ll = belief_trial_loglikes(params, c, r, n_rules, session_starts)
     if score_mask is not None:
         ll = ll[np.asarray(score_mask, bool)]
     return float(-np.nansum(ll))
 
 
-def belief_ck_negloglike(params, c, r, n_rules: int = 2, score_mask=None) -> float:
+def belief_ck_negloglike(params, c, r, n_rules: int = 2, score_mask=None,
+                         session_starts=None) -> float:
     """
     Negative log-likelihood for the belief + choice-kernel model.
 
@@ -301,29 +256,136 @@ def belief_ck_negloglike(params, c, r, n_rules: int = 2, score_mask=None) -> flo
     if H <= 0 or H >= 1 or beta <= 0 or alpha_k < 0 or alpha_k > 1 or beta_k <= 0:
         return 1e9
 
-    ll = belief_ck_trial_loglikes(params, c, r, n_rules)
+    ll = belief_ck_trial_loglikes(params, c, r, n_rules, session_starts)
     if score_mask is not None:
         ll = ll[np.asarray(score_mask, bool)]
     return float(-np.nansum(ll))
 
 
 # ---------------------------------------------------------------------------
-# Model fitting (BADS, as in Murphy et al.; L-BFGS-B available as fallback)
+# Model fitting (L-BFGS-B with random restarts)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Model fitting (L-BFGS-B by default, or PyBADS with fallback)
+# ---------------------------------------------------------------------------
+
+# Murphy et al. fixed initial values (used as the first BADS start):
+#   H = 0.1, beta = 5, alpha_k = 0.2, beta_k = 5
+_MURPHY_X0 = {"belief": [0.1, 5.0], "belief_ck": [0.1, 5.0, 0.2, 5.0]}
+
+
+def _optimize(negll, args, bounds, n_restarts, rng, optimizer, x0_sampler, murphy_x0):
+    """
+    Minimise `negll(params, *args)` over `bounds` with multi-start.
+
+    optimizer : "lbfgs" (default; scipy L-BFGS-B, the original engine) or "bads"
+        (PyBADS, the optimizer Murphy et al. used). If "bads" is requested but
+        pybads is not importable, a warning is issued and it falls back to
+        L-BFGS-B, so a run never ends up worse than the default.
+
+    Returns (best_fun, best_x).
+    """
+    optimizer = (optimizer or "lbfgs").lower()
+    lb = np.array([b[0] for b in bounds], float)
+    ub = np.array([b[1] for b in bounds], float)
+    best_fun, best_x = np.inf, None
+
+    if optimizer == "bads":
+        try:
+            from pybads import BADS
+        except Exception:
+            warnings.warn("pybads not installed; falling back to L-BFGS-B "
+                          "(run `pip install pybads` to use BADS).")
+            optimizer = "lbfgs"
+
+    if optimizer == "bads":
+        from pybads import BADS
+        plb = lb + 0.05 * (ub - lb)        # plausible bounds, just inside hard bounds
+        pub = ub - 0.05 * (ub - lb)
+        starts = [np.array(murphy_x0, float)]          # Murphy's fixed init first
+        for _ in range(max(n_restarts - 1, 0)):        # plus random restarts
+            starts.append(np.array(x0_sampler(rng), float))
+        for x0 in starts:
+            x0 = np.clip(x0, plb, pub)
+            try:
+                res = BADS(lambda x: negll(x, *args), x0, lb, ub, plb, pub,
+                           options={"display": "off"}).optimize()
+                fun, x = float(res["fval"]), np.asarray(res["x"], float)
+            except Exception as e:
+                warnings.warn(f"BADS restart failed ({e}); skipping it.")
+                continue
+            if fun < best_fun:
+                best_fun, best_x = fun, x
+        if best_x is not None:
+            return best_fun, best_x
+        warnings.warn("all BADS restarts failed; falling back to L-BFGS-B.")
+
+    # L-BFGS-B (default, or fallback)
+    for _ in range(n_restarts):
+        x0 = np.array(x0_sampler(rng), float)
+        res = minimize(negll, x0, args=args, method="L-BFGS-B", bounds=bounds)
+        if res.fun < best_fun:
+            best_fun, best_x = res.fun, res.x
+    return best_fun, best_x
+
+
+# ---------------------------------------------------------------------------
+# Single-start BADS wrapper (compatibility shim for belief_vhr.py).
+# belief_vhr calls `_run_bads(fun, x0, lb, ub, plb, pub) -> (par, nll)` inside
+# its own restart loop, so this runs ONE BADS optimization from a given start
+# and returns (best_params, best_negloglike). If pybads is unavailable it warns
+# once and falls back to a single L-BFGS-B minimisation over the hard bounds, so
+# belief_vhr keeps working without BADS installed.
+# ---------------------------------------------------------------------------
+try:
+    from pybads import BADS as _BADS          # noqa: F401
+    _HAVE_BADS = True
+except Exception:
+    _HAVE_BADS = False
+
+_WARNED_NO_BADS = False
+
+
+def _run_bads(fun, x0, lb, ub, plb, pub):
+    """One BADS run from x0 over [lb, ub] (plausible [plb, pub]); returns (x, f).
+
+    Falls back to L-BFGS-B if pybads is not installed."""
+    global _WARNED_NO_BADS
+    x0 = np.asarray(x0, float)
+    lb = np.asarray(lb, float);  ub = np.asarray(ub, float)
+    plb = np.asarray(plb, float); pub = np.asarray(pub, float)
+    if _HAVE_BADS:
+        from pybads import BADS
+        x0c = np.clip(x0, plb, pub)
+        res = BADS(fun, x0c, lb, ub, plb, pub,
+                   options={"display": "off"}).optimize()
+        return np.asarray(res["x"], float), float(res["fval"])
+    if not _WARNED_NO_BADS:
+        warnings.warn("pybads not installed; _run_bads falls back to L-BFGS-B "
+                      "(run `pip install pybads` to use BADS).")
+        _WARNED_NO_BADS = True
+    res = minimize(fun, x0, method="L-BFGS-B", bounds=list(zip(lb, ub)))
+    return res.x, float(res.fun)
+
+
 def fit_belief(c, r, n_rules: int = 2, n_restarts: int = 5,
-               rng=None, score_mask=None, optimizer: str = "bads") -> dict:
+               rng=None, score_mask=None, session_starts=None,
+               optimizer: str = "lbfgs") -> dict:
     """
     Fit the belief model to observed choices and rewards.
 
-    optimizer : "bads" (default; PyBADS, as in Murphy et al. 2024) or "lbfgs"
-    (scipy L-BFGS-B fallback for environments without pybads). The first
-    restart starts from Murphy's published initial values (H=0.1, beta=5); any
-    further restarts start from random points and the best fit is kept.
+    With score_mask=None this fits on all choice trials (the original
+    behaviour). With a boolean score_mask, the negative log-likelihood is
+    minimised over the scored trials only, while the latent state still
+    propagates through every trial (used for cross-validation: pass the train
+    mask here). The returned BIC / nlike are computed over the scored trials.
 
-    With a boolean score_mask the negative log-likelihood is minimised over the
-    scored trials only, while the latent state still propagates through every
-    trial (cross-validation). The returned BIC / nlike use the scored trials.
+    session_starts : optional trial indices where a new session begins; passed
+        through to the latent-state propagation so the belief is reset to the
+        prior at each session boundary (per-animal concatenated fitting). None
+        (default) = single-session behaviour, no resets.
+    optimizer : "lbfgs" (default) or "bads" (PyBADS, with L-BFGS-B fallback).
 
     Returns
     -------
@@ -338,23 +400,13 @@ def fit_belief(c, r, n_rules: int = 2, n_restarts: int = 5,
     else:
         n_obs = int(np.sum(~np.isnan(c) & np.asarray(score_mask, bool)))
 
-    # Murphy bounds: 0..1 for H, 0..100 for the inverse temperature.
-    lb, ub   = [0.0, 0.0],   [1.0, 100.0]
-    plb, pub = [0.02, 1.0],  [0.7, 20.0]
-    fun = lambda x: belief_negloglike(x, c, r, n_rules, score_mask)
-    murphy_x0 = [0.1, 5.0]   # Murphy et al. 2024 published initial values
-
-    best_nll, best_par = np.inf, None
-    for i in range(n_restarts):
-        x0 = murphy_x0 if i == 0 else [rng.uniform(0.01, 0.49), rng.uniform(0.5, 15.0)]
-        if optimizer == "bads":
-            par, nll = _run_bads(fun, x0, lb, ub, plb, pub)
-        else:
-            res = minimize(belief_negloglike, x0, args=(c, r, n_rules, score_mask),
-                           method="L-BFGS-B", bounds=[(1e-6, 1.0 - 1e-6), (1e-3, 100.0)])
-            par, nll = res.x, res.fun
-        if nll < best_nll:
-            best_nll, best_par = nll, par
+    best_nll, best_par = _optimize(
+        belief_negloglike, (c, r, n_rules, score_mask, session_starts),
+        bounds=[(1e-6, 1.0 - 1e-6), (1e-3, 100.0)],
+        n_restarts=n_restarts, rng=rng, optimizer=optimizer,
+        x0_sampler=lambda g: [g.uniform(0.01, 0.49), g.uniform(0.5, 15.0)],
+        murphy_x0=_MURPHY_X0["belief"],
+    )
 
     bic = 2.0 * best_nll + 2.0 * np.log(max(n_obs, 1))
     return {
@@ -367,13 +419,12 @@ def fit_belief(c, r, n_rules: int = 2, n_restarts: int = 5,
 
 
 def fit_belief_ck(c, r, n_rules: int = 2, n_restarts: int = 5,
-                  rng=None, score_mask=None, optimizer: str = "bads") -> dict:
+                  rng=None, score_mask=None, session_starts=None,
+                  optimizer: str = "lbfgs") -> dict:
     """
     Fit the belief-CK model to observed choices and rewards.
 
-    See `fit_belief` for the optimizer / score_mask semantics. The first restart
-    starts from Murphy's published initial values (H=0.1, beta=5, alpha_k=0.2,
-    beta_k=5).
+    See `fit_belief` for the score_mask / session_starts / optimizer semantics.
 
     Returns
     -------
@@ -388,32 +439,17 @@ def fit_belief_ck(c, r, n_rules: int = 2, n_restarts: int = 5,
     else:
         n_obs = int(np.sum(~np.isnan(c) & np.asarray(score_mask, bool)))
 
-    # Murphy bounds: 0..1 for H and alpha_k, 0..100 for the inverse temperatures.
-    lb  = [0.0, 0.0, 0.0, 0.0]
-    ub  = [1.0, 100.0, 1.0, 100.0]
-    plb = [0.02, 1.0, 0.02, 1.0]
-    pub = [0.7, 20.0, 0.9, 20.0]
-    fun = lambda x: belief_ck_negloglike(x, c, r, n_rules, score_mask)
-    murphy_x0 = [0.1, 5.0, 0.2, 5.0]   # Murphy et al. 2024 published initial values
-
-    best_nll, best_par = np.inf, None
-    for i in range(n_restarts):
-        x0 = murphy_x0 if i == 0 else [
-            rng.uniform(0.01, 0.49),
-            rng.uniform(0.5,  15.0),
-            rng.uniform(0.01, 0.49),
-            rng.uniform(0.5,  10.0),
-        ]
-        if optimizer == "bads":
-            par, nll = _run_bads(fun, x0, lb, ub, plb, pub)
-        else:
-            res = minimize(belief_ck_negloglike, x0, args=(c, r, n_rules, score_mask),
-                           method="L-BFGS-B",
-                           bounds=[(1e-6, 1.0 - 1e-6), (1e-3, 100.0),
-                                   (1e-6, 1.0 - 1e-6), (1e-3, 100.0)])
-            par, nll = res.x, res.fun
-        if nll < best_nll:
-            best_nll, best_par = nll, par
+    best_nll, best_par = _optimize(
+        belief_ck_negloglike, (c, r, n_rules, score_mask, session_starts),
+        bounds=[(1e-6, 1.0 - 1e-6),   # H
+                (1e-3, 100.0),         # beta
+                (1e-6, 1.0 - 1e-6),   # alpha_k
+                (1e-3, 100.0)],        # beta_k
+        n_restarts=n_restarts, rng=rng, optimizer=optimizer,
+        x0_sampler=lambda g: [g.uniform(0.01, 0.49), g.uniform(0.5, 15.0),
+                              g.uniform(0.01, 0.49), g.uniform(0.5, 10.0)],
+        murphy_x0=_MURPHY_X0["belief_ck"],
+    )
 
     bic = 2.0 * best_nll + 4.0 * np.log(max(n_obs, 1))
     return {
@@ -475,15 +511,14 @@ def simulate_belief(c_real, r_real, rule, H: float, beta: float,
     for s in range(n_sims):
         b = 0.5
         for t in range(n):
-            # Decision uses the belief carried into the trial (Murphy order);
-            # belief[t,s] is the decision-time belief, not a post-transition one.
-            belief[t, s] = b
+            b_hat = _transition(b, H)
+            belief[t, s] = b_hat
 
             if miss[t]:
-                b = _transition(b, H)   # no observation → transition only
+                b = b_hat   # no observation → just propagate
                 continue
 
-            qdiff      = _q_diff(b, p_high, p_low)
+            qdiff      = _q_diff(b_hat, p_high, p_low)
             pl         = expit(beta * qdiff)
             p_left[t, s] = pl
 
@@ -499,8 +534,7 @@ def simulate_belief(c_real, r_real, rule, H: float, beta: float,
             else:
                 rt = np.nan
 
-            # End-of-trial update: transition (Eq. 7) then Bayes (Eq. 8).
-            b = _belief_update(_transition(b, H), ct, rt, p_high, p_low)
+            b = _belief_update(b_hat, ct, rt, p_high, p_low)
 
     return {"c_sim": c_sim, "belief": belief, "p_left": p_left}
 
@@ -546,14 +580,14 @@ def simulate_belief_ck(c_real, r_real, rule,
         ck = np.zeros(2)   # [CK_left, CK_right]
 
         for t in range(n):
-            # Decision uses belief and choice kernel carried into the trial.
-            belief[t, s] = b
+            b_hat = _transition(b, H)
+            belief[t, s] = b_hat
 
             if miss[t]:
-                b = _transition(b, H)   # transition only on misses
+                b = b_hat
                 continue
 
-            qdiff       = _q_diff(b, p_high, p_low)
+            qdiff       = _q_diff(b_hat, p_high, p_low)
             ck_d        = ck[0] - ck[1]
             logit       = beta * qdiff + beta_k * ck_d
             pl          = expit(logit)
@@ -572,8 +606,7 @@ def simulate_belief_ck(c_real, r_real, rule,
             else:
                 rt = np.nan
 
-            # End-of-trial updates: belief transition+Bayes, then choice kernel.
-            b = _belief_update(_transition(b, H), ct, rt, p_high, p_low)
+            b = _belief_update(b_hat, ct, rt, p_high, p_low)
 
             if ct == -1:
                 ck[0] = ck[0] + alpha_k * (1.0 - ck[0])

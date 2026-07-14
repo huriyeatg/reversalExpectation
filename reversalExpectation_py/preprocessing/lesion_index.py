@@ -76,7 +76,10 @@ def add_lesion_info(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 NUM_TRIAL_CRITERION  = 100   # min responsive trials
-NUM_SWITCH_CRITERION = 2     # min rule switches
+NUM_SWITCH_CRITERION = 3     # min rule switches: keep sessions with switch_num > 3,
+                             # i.e. >= 4 block switches. Matches Murphy et al. 2024
+                             # ("excluded the session if the animal had fewer than 4
+                             # block switches", Methods)
 
 
 def compute_session_criteria(df: pd.DataFrame) -> pd.DataFrame:
@@ -101,6 +104,6 @@ def compute_session_criteria(df: pd.DataFrame) -> pd.DataFrame:
 
     n_total = len(df)
     n_pass  = df["meets_criteria"].sum()
-    print(f"Out of {n_total} trials, {n_pass} met performance criteria.")
+    print(f"Out of {n_total} sessions, {n_pass} met performance criteria.")
 
     return df

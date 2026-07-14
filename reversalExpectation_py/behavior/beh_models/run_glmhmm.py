@@ -81,7 +81,7 @@ PARAMETRIZATION = "ashwood_wsls"   # "ashwood_wsls" (faithful) | "reward_perseve
 SUBSET_N_ANIMALS = None
 
 K_RANGE     = (1, 2, 3, 4)   # swept by the CV (needed for the K-selection curve)
-CHOSEN_K    = 2              # final model + state-stability (must be in K_RANGE)
+CHOSEN_K    = 3              # final model + state-stability (must be in K_RANGE)
 N_RESTARTS  = 15
 N_ITERS     = 200
 N_FOLDS     = 5
@@ -91,7 +91,8 @@ RUN_CV           = False     # cross-validate held-out LL across K
 RUN_COMPARISON   = False     # GLM vs lapse vs GLM-HMM(CHOSEN_K)
 RUN_KSELECTION   = False     # slide figures: CV curve + state-stability
 RUN_ANTICIPATION = True     # anticipation test (P(worse|tau) in L_Random)
-RUN_STATE_OCCUPANCY = True  # state occupancy: block-end aligned + within-session
+RUN_STATE_OCCUPANCY = False  # state occupancy: block-end aligned + within-session
+RUN_PER_SESSION_OCCUPANCY = True  # one figure per session (~616 files); slow, off by default
 
 # FORCE_REFIT: if True, always re-fit the GLM-HMM and OVERWRITE glmhmm_states.csv,
 # even when that cache already exists. Use it whenever the model or the data
@@ -273,10 +274,32 @@ def main():
             dfo = dfo[dfo["glmhmm_state"].notna()].copy()
             print(f"  merged cached states onto {len(dfo)} trials, "
                   f"{dfo.groupby(['animal','session_file']).ngroups} sessions")
+        OCC = FIGS_DIR / "occupancy"          # group all occupancy figures here
         fig_o = occ.plot_state_occupancy(
             dfo, state_labels=STATE_LABELS,
-            outfile=str(FIGS_DIR / f"glmhmm_state_occupancy_K{CHOSEN_K}.png"))
+            outfile=str(OCC / f"glmhmm_state_occupancy_K{CHOSEN_K}.png"))
         print(f"[occupancy] wrote {fig_o}")
+
+        # L_Random-stratified (pre-switch only), by-tau, and across-switch views
+        occ.plot_state_occupancy_by_lrandom(
+            dfo, state_labels=STATE_LABELS,
+            outfile=str(OCC / f"glmhmm_state_occupancy_by_lrandom_K{CHOSEN_K}.png"))
+        occ.plot_state_occupancy_by_lrandom_tau(
+            dfo, state_labels=STATE_LABELS,
+            outfile=str(OCC / f"glmhmm_state_occupancy_tau_K{CHOSEN_K}.png"))
+        occ.plot_state_occupancy_by_lrandom_tau(
+            dfo, state_labels=STATE_LABELS, normalize_by_animal=True,
+            outfile=str(OCC / f"glmhmm_state_occupancy_tau_norm_K{CHOSEN_K}.png"))
+        occ.plot_state_occupancy_across_switch(
+            dfo, state_labels=STATE_LABELS,
+            outfile=str(OCC / f"glmhmm_state_occupancy_across_switch_K{CHOSEN_K}.png"))
+        print(f"[occupancy] wrote stratified / tau / across-switch figures to {OCC}")
+
+        # one figure per session (many files) -> figs/occupancy/per_session/
+        if RUN_PER_SESSION_OCCUPANCY:
+            occ.plot_per_session_occupancy(
+                dfo, state_labels=STATE_LABELS,
+                outdir=str(OCC / "per_session"))
 
     # ---- state-stability (slide) ------------------------------------------
     if RUN_KSELECTION:
@@ -381,7 +404,7 @@ def main():
 
         # 6) figure, with the inference annotated on the anticipation panel
         fig_a = at.plot_anticipation(cur_all, cur_eng, band_eng, pstate=peng,
-                                     state_name="engaged", inference=inf,
+                                     state_name=STATE_LABELS[engaged_idx], inference=inf,
                                      outfile=str(FIGS_DIR / f"anticipation_test_K{CHOSEN_K}.png"))
         print(f"done in {time.time()-t0:.0f}s")
         print(f"[anticipation] wrote {fig_a}")

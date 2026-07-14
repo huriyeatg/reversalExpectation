@@ -54,6 +54,9 @@ from behavior.master_behavior import (
 from behavior.beh_models.master_model import run_models
 from neuromodulator.master_neuromodulator import run as run_neuromodulator
 from behavior.beh_models.belief_vhr_lrandom import run_vhr_lrandom_test
+from behavior.directed_switch import run_directed_switch
+from behavior.beh_models.anticipation_integrated import run_integrated_anticipation
+
 
 # ===========================================================================
 # Setup helpers
@@ -184,7 +187,7 @@ if __name__ == "__main__":
     RUN_ANALYSIS       = False
     RUN_MODELS         = False
     RUN_VHR_LRANDOM    = False
-    RUN_PLOTS          = False
+    RUN_PLOTS          = True
     RUN_NEUROMODULATOR = False
 
     # Lesion-status filter applied to the loaded CSV BEFORE both models and figures.
@@ -204,7 +207,7 @@ if __name__ == "__main__":
     # Within PART 2: whether to run the (slow) model simulation.
     #   False -> only figures that DON'T need the simulation
     #   True  -> all figures (adds the model-simulated curves)
-    RUN_SIMULATION = False
+    RUN_SIMULATION = True
     N_SIMS         = 100         # simulated runs per session (if RUN_SIMULATION)
 
     # Simulation cache (see simulate_sessions in master_behavior.py).
@@ -266,7 +269,8 @@ if __name__ == "__main__":
         alternation_after_correct_figure(df, pair="across")   # -> figs/alternation_after_correct_across.png
         # make_switch_figure(df)                    # -> figs/switches_hrside_random.png
         # make_lateral_switch_figure(df)            # -> figs/switches_lateral_random.png
-
+        run_directed_switch(df, output_dir="analysis", figs_dir="figs")
+        run_integrated_anticipation(df, output_dir="analysis", figs_dir="figs")
         # --- Simulation (optional) ---
         # sim = {}        -> comparison calls produce ONLY the real curves.
         # sim populated   -> they also add the model-simulated curves.
