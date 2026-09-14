@@ -33,6 +33,7 @@ from matplotlib import font_manager
 CREAM = "#FBFAF6"; INK = "#1A2E2A"
 STATE_COLORS = ["#2C5F2D", "#C9472B", "#E8A33D", "#3A6EA5", "#7B5EA7"]  # by state index
 GRID = "#D8D5CC"
+MUTE = "#6B6B66"
 
 _BLOCK_KEYS = ["animal", "session_file", "block_idx"]
 _SESS_KEYS = ["animal", "session_file"]
@@ -587,17 +588,19 @@ def occupancy_across_switch_by_lrandom(
 def plot_state_occupancy_across_switch(
         df, state_col="glmhmm_state", states=None, state_labels=None,
         lrandom_bins=_LRANDOM_BINS, trials_back=10, trials_fwd=10, min_n=30,
-        y_zoom=True, show_ci=True, title=None,
+        y_zoom=True, show_ci=True, only_state=None, title=None,
         outfile="glmhmm_state_occupancy_across_switch.png"):
-    """One panel per state; within each, P(state | x) around the switch
-    (x in [-trials_back, +trials_fwd], 0 = first post-switch trial), one curve
-    per L_Random bin of the ending block (darker = longer). show_ci draws the
-    binomial 95% CI as a shaded band."""
+    """P(state | x) around the switch (x in [-trials_back, +trials_fwd], 0 =
+    first post-switch trial), one curve per L_Random bin of the ending block
+    (darker = longer). show_ci draws the mean +/- SEM band.
+
+    By default one panel per state. Pass only_state=<index> to draw a SINGLE
+    panel for just that state (e.g. only_state=1 for a global P(explore) figure
+    with the four L_Random-bin curves)."""
     occ, states = occupancy_across_switch_by_lrandom(
         df, state_col, states, lrandom_bins, trials_back, trials_fwd, min_n)
     if not len(occ):
         raise ValueError("no across-switch occupancy rows (check min_n / columns)")
-    n_states = len(states)
     if state_labels is None:
         state_labels = [f"state {s}" for s in range(max(states) + 1)]
     font = _font()
@@ -605,9 +608,11 @@ def plot_state_occupancy_across_switch(
             if ((occ["lr_lo"] == lo) & (occ["lr_hi"] == hi)).any()]
     shades = np.linspace(0.62, 0.0, len(bins))
 
-    fig, axes = plt.subplots(1, n_states, figsize=(6.4 * n_states, 4.8), squeeze=False)
+    plot_states = [only_state] if only_state is not None else list(states)
+    n_panels = len(plot_states)
+    fig, axes = plt.subplots(1, n_panels, figsize=(6.4 * n_panels, 4.8), squeeze=False)
     axes = axes[0]
-    for ax, st in zip(axes, states):
+    for ax, st in zip(axes, plot_states):
         base = STATE_COLORS[st % len(STATE_COLORS)]
         pvals = []
         for (lo, hi), t in zip(bins, shades):
@@ -631,8 +636,8 @@ def plot_state_occupancy_across_switch(
             ax.set_ylim(max(0.0, lo_y - pad), min(1.0, hi_y + pad))
         ax.set_xlabel("trials relative to switch  (0 = first post-switch trial)",
                       fontsize=9.5, fontfamily=font)
-        ax.set_ylabel("P(state)", fontsize=9.5, fontfamily=font)
         lab = state_labels[st] if st < len(state_labels) else f"state {st}"
+        ax.set_ylabel(f"P({lab})", fontsize=9.5, fontfamily=font)
         ax.set_title(lab, fontsize=11, fontfamily=font, color=INK, weight="bold")
         ax.legend(frameon=False, fontsize=8, prop={"family": font},
                   title="darker = longer L_Random", title_fontsize=7.5)
@@ -641,8 +646,12 @@ def plot_state_occupancy_across_switch(
             ax.spines[sp].set_visible(False)
 
     if title is None:
-        title = (f"State occupancy across the switch by L_Random length  "
-                 f"(K={n_states})")
+        if only_state is not None:
+            lab = state_labels[only_state] if only_state < len(state_labels) else f"state {only_state}"
+            title = f"P({lab}) across the switch by L_Random length"
+        else:
+            title = (f"State occupancy across the switch by L_Random length  "
+                     f"(K={len(states)})")
     fig.suptitle(title, fontsize=13, fontfamily=font, color=INK, weight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     Path(outfile).parent.mkdir(parents=True, exist_ok=True)
@@ -653,17 +662,15 @@ def plot_state_occupancy_across_switch(
 
 def plot_per_session_occupancy(
         df, state_col="glmhmm_state", states=None, state_labels=None,
-        smooth_window=15, n_points=100, outdir="figs/occupancy/per_session",
-        max_sessions=None, fname_prefix="session"):
-    """One figure PER session: smoothed P(state) vs normalized session position
-    (0 = start, 1 = end), both states, no error band (a single session is one
-    realization). Smoothing is a centered moving average of the per-trial state
-    indicator over `smooth_window` trials, sampled at `n_points` positions.
+        smooth_window=15, outdir="figs/occupancy/per_session",
+        max_sessions=None, fname_prefix="session", show_switches=True):
+    """One figure PER session: smoothed P(state) over the REAL trial axis
+    (1..N_trials, unnormalized), both states, no error band (a single session is
+    one realization). Vertical dashed lines mark block switches. Smoothing is a
+    centered, edge-corrected moving average over `smooth_window` trials.
 
     Writes <outdir>/<prefix>_<animal>_<session>.png for each session and returns
     the list of written paths. Use max_sessions to cap output while testing."""
-    if "pos_in_session_norm" not in df.columns:
-        df = add_positions(df)
     if states is None:
         states = tuple(sorted(int(s) for s in pd.unique(df[state_col].dropna())))
     if state_labels is None:
@@ -681,30 +688,37 @@ def plot_per_session_occupancy(
         d = d[d[state_col].notna()]
         if len(d) < smooth_window:
             continue
-        pos = d["pos_in_session_norm"].to_numpy()
-        order = np.argsort(pos)
-        pos = pos[order]
-        sv = d[state_col].to_numpy()[order]
+        sv = d[state_col].to_numpy()
+        x = np.arange(1, len(sv) + 1)                      # real trial number
 
-        fig, ax = plt.subplots(figsize=(7.2, 4.3))
+        fig, ax = plt.subplots(figsize=(8.4, 4.3))
         fig.patch.set_facecolor(CREAM); ax.set_facecolor(CREAM)
+
+        # switch positions: where block_idx changes (drawn first, behind curves)
+        if show_switches and "block_idx" in d.columns:
+            blk = d["block_idx"].to_numpy()
+            sw = np.where(blk[1:] != blk[:-1])[0] + 1        # index of first trial of new block
+            for i, xs_ in enumerate(sw):
+                ax.axvline(x[xs_] - 0.5, color=MUTE, ls="--", lw=0.8, alpha=0.55,
+                           label="switch" if i == 0 else None)
+
         w = min(smooth_window, len(sv))
         kern = np.ones(w) / w
-        xs = np.linspace(0, 1, n_points)
         for st in states:
             ind = (sv == st).astype(float)
             sm = np.convolve(ind, kern, mode="same")
-            # fix convolution edge bias by dividing by the local window coverage
             cov = np.convolve(np.ones_like(ind), kern, mode="same")
-            sm = sm / np.clip(cov, 1e-9, None)
-            ys = np.interp(xs, pos, sm)
+            sm = sm / np.clip(cov, 1e-9, None)              # edge-corrected moving avg
             col = STATE_COLORS[st % len(STATE_COLORS)]
             lab = state_labels[st] if st < len(state_labels) else f"state {st}"
-            ax.plot(xs, ys, "-", lw=2, color=col, label=lab)
-        ax.set_ylim(0, 1)
-        ax.set_xlabel("position in session  (0 = start, 1 = end)", fontsize=10, fontfamily=font)
+            ax.plot(x, sm, "-", lw=2, color=col, label=lab)
+
+        ax.set_ylim(0, 1); ax.set_xlim(0.5, len(sv) + 0.5)
+        ax.set_xlabel("trial number", fontsize=10, fontfamily=font)
         ax.set_ylabel("P(state)  (moving average)", fontsize=10, fontfamily=font)
-        ax.set_title(f"{animal}  ·  {Path(str(ses)).stem}  ·  {len(d)} trials",
+        n_sw = len(sw) if (show_switches and "block_idx" in d.columns) else 0
+        ax.set_title(f"{animal}  ·  {Path(str(ses)).stem}  ·  {len(d)} trials, "
+                     f"{n_sw} switches",
                      fontsize=11, fontfamily=font, color=INK, weight="bold")
         ax.legend(frameon=False, fontsize=9, prop={"family": font}, loc="upper right")
         ax.grid(True, color=GRID, lw=0.6, alpha=0.6)
@@ -718,6 +732,228 @@ def plot_per_session_occupancy(
         written.append(out)
     print(f"[per-session] wrote {len(written)} figures to {outdir}")
     return written
+
+
+def plot_per_session_triptych(
+        df, state_col="glmhmm_state", states=None, state_labels=None,
+        exploit_state=0, smooth_window=15, outdir="figs/occupancy/per_session_3panel",
+        max_sessions=None, fname_prefix="triptych", show_switches=True):
+    """Three stacked panels per session, sharing the trial-number x-axis so the
+    three signals can be read against each other (Murphy-style):
+
+      (1) State per trial   -- a colour band, one cell per trial (exploit vs
+          explore), the raw Viterbi/assigned state.
+      (2) P(state)          -- the smoothed moving-average occupancy curves.
+      (3) Choice quality    -- a colour band of chose-better vs chose-worse
+          (choice == hr_side), with reward ticks along the top.
+
+    Block switches are marked by dashed vertical lines in all three panels.
+    Needs choice / hr_side (and optionally rewarded) columns in addition to the
+    state; merge them from the main dataframe before calling if the states CSV
+    lacks them."""
+    need = ["choice", "hr_side"]
+    miss = [c for c in need if c not in df.columns]
+    if miss:
+        raise KeyError(f"plot_per_session_triptych needs {miss} (merge from main df)")
+    if states is None:
+        states = tuple(sorted(int(s) for s in pd.unique(df[state_col].dropna())))
+    if state_labels is None:
+        state_labels = [f"state {s}" for s in range(max(states) + 1)]
+    font = _font()
+    Path(outdir).mkdir(parents=True, exist_ok=True)
+    explore_state = 1 if exploit_state == 0 else 0
+    C_EXPLOIT = STATE_COLORS[exploit_state % len(STATE_COLORS)]
+    C_EXPLORE = STATE_COLORS[explore_state % len(STATE_COLORS)]
+    C_BETTER = "#3A6EA5"; C_WORSE = "#E8A33D"      # blue / gold, distinct from state greens
+
+    written = []
+    grp = list(df.groupby(_SESS_KEYS, sort=False))
+    if max_sessions is not None:
+        grp = grp[:max_sessions]
+
+    for (animal, ses), d in grp:
+        d = d.sort_values("trial_idx") if "trial_idx" in d else d
+        d = d[d[state_col].notna()]
+        if len(d) < smooth_window:
+            continue
+        sv = d[state_col].to_numpy()
+        x = np.arange(1, len(sv) + 1)
+        choice = d["choice"].to_numpy()
+        hr = d["hr_side"].to_numpy()
+        rewarded = d["rewarded"].to_numpy() if "rewarded" in d else np.full(len(d), np.nan)
+        # switches
+        sw = np.array([], int)
+        if show_switches and "block_idx" in d.columns:
+            blk = d["block_idx"].to_numpy()
+            sw = np.where(blk[1:] != blk[:-1])[0] + 1
+
+        fig, (ax1, ax2, ax3) = plt.subplots(
+            3, 1, figsize=(10.5, 5.6), sharex=True,
+            gridspec_kw={"height_ratios": [0.7, 2.2, 0.9], "hspace": 0.18})
+        fig.patch.set_facecolor(CREAM)
+        for a in (ax1, ax2, ax3):
+            a.set_facecolor(CREAM)
+
+        # ---- Panel 1: state per trial as a colour band --------------------
+        band = np.where(sv == exploit_state, 0.0, 1.0).reshape(1, -1)
+        from matplotlib.colors import ListedColormap
+        ax1.imshow(band, aspect="auto", cmap=ListedColormap([C_EXPLOIT, C_EXPLORE]),
+                   extent=[0.5, len(sv) + 0.5, 0, 1], vmin=0, vmax=1, interpolation="nearest")
+        ax1.set_yticks([]); ax1.set_ylabel("state", fontsize=9.5, fontfamily=font, rotation=0,
+                                           ha="right", va="center")
+        import matplotlib.patches as mpatches
+        # (no legend on panel 1 -- the same exploit/explore colours are labelled
+        #  by panel 2's line legend, and a band legend here collides with the title)
+
+        # ---- Panel 2: smoothed P(state) -----------------------------------
+        w = min(smooth_window, len(sv)); kern = np.ones(w) / w
+        for st in states:
+            ind = (sv == st).astype(float)
+            sm = np.convolve(ind, kern, mode="same")
+            cov = np.convolve(np.ones_like(ind), kern, mode="same")
+            sm = sm / np.clip(cov, 1e-9, None)
+            ax2.plot(x, sm, "-", lw=1.8, color=STATE_COLORS[st % len(STATE_COLORS)],
+                     label=state_labels[st] if st < len(state_labels) else f"state {st}")
+        ax2.set_ylim(0, 1); ax2.set_ylabel("P(state)\n(moving avg)", fontsize=9.5, fontfamily=font)
+        ax2.legend(frameon=False, fontsize=8, loc="center left",
+                   bbox_to_anchor=(1.005, 0.5), prop={"family": font})
+        ax2.grid(True, color=GRID, lw=0.5, alpha=0.5)
+
+        # ---- Panel 3: chose-better / chose-worse band + reward ticks ------
+        valid = ~np.isnan(choice) & ~np.isnan(hr)
+        qual = np.full(len(sv), np.nan)
+        qual[valid] = (choice[valid] == hr[valid]).astype(float)   # 1=better, 0=worse
+        qband = np.where(np.isnan(qual), np.nan, 1.0 - qual).reshape(1, -1)  # 0=better,1=worse
+        cmapq = ListedColormap([C_BETTER, C_WORSE])
+        ax3.imshow(np.ma.masked_invalid(qband), aspect="auto", cmap=cmapq,
+                   extent=[0.5, len(sv) + 0.5, 0, 1], vmin=0, vmax=1, interpolation="nearest")
+        # reward ticks along the top of panel 3
+        rew_x = x[(rewarded == 1)] if not np.all(np.isnan(rewarded)) else np.array([])
+        ax3.scatter(rew_x, np.full(len(rew_x), 1.06), marker="|", s=18, color=INK, lw=0.6,
+                    clip_on=False)
+        ax3.set_yticks([]); ax3.set_ylabel("choice", fontsize=9.5, fontfamily=font, rotation=0,
+                                           ha="right", va="center")
+        ax3.legend(handles=[mpatches.Patch(color=C_BETTER, label="chose better"),
+                            mpatches.Patch(color=C_WORSE, label="chose worse"),
+                            plt.Line2D([0], [0], marker="|", color=INK, lw=0, label="reward")],
+                   frameon=False, fontsize=8, loc="center left",
+                   bbox_to_anchor=(1.005, 0.5), prop={"family": font})
+        ax3.set_xlabel("trial number", fontsize=10, fontfamily=font)
+
+        # switches on all panels
+        for a in (ax1, ax2, ax3):
+            for j in sw:
+                a.axvline(x[j] - 0.5, color=MUTE, ls="--", lw=0.8, alpha=0.6)
+            a.set_xlim(0.5, len(sv) + 0.5)
+            for sp in ("top", "right"):
+                a.spines[sp].set_visible(False)
+
+        ax1.set_title(f"{animal}  ·  {Path(str(ses)).stem}  ·  {len(d)} trials, {len(sw)} switches",
+                      fontsize=11, fontfamily=font, color=INK, weight="bold", pad=18)
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(Path(str(ses)).stem))
+        out = str(Path(outdir) / f"{fname_prefix}_{animal}_{safe}.png")
+        fig.savefig(out, facecolor=CREAM, bbox_inches="tight", dpi=130)
+        plt.close(fig)
+        written.append(out)
+    print(f"[triptych] wrote {len(written)} figures to {outdir}")
+    return written
+
+
+def choice_quality_by_state_lrandom(
+        df, state_col="glmhmm_state", exploit_state=0, explore_state=1,
+        animal_col="animal", min_trials=20, tau_max=None,
+        lrandom_col="block_trial_random_added", ttc_col="block_trial_to_crit",
+        complete_only=True, drop_last_block=True):
+    """
+    Correlate STATE (panel 1) with CHOICE QUALITY (panel 3) across sessions:
+    per animal, compare P(chose better | exploit) vs P(chose better | explore)
+    over the pre-switch L_Random window. 'chose better' = choice == hr_side.
+
+    The animal is the unit: for each animal we compute the two conditional
+    probabilities, then test the paired difference (exploit - explore) across
+    animals with a Wilcoxon signed-rank test. If P(better|exploit) >>
+    P(better|explore), the exploit state really is exploiting the better option
+    while explore is closer to chance -- a behavioural validation of the states.
+
+    Returns a dict with the per-animal table and the test summary.
+    """
+    need = ["choice", "hr_side", lrandom_col, ttc_col]
+    miss = [c for c in need if c not in df.columns]
+    if miss:
+        raise KeyError(f"choice_quality_by_state_lrandom needs {miss}")
+    if "pos_in_block" not in df.columns:
+        df = add_positions(df)
+    d = df.copy()
+    if complete_only and "block_complete" in d:
+        d = d[d["block_complete"]]
+    if drop_last_block and "is_last_block" in d:
+        d = d[~d["is_last_block"]]
+    d["tau"] = d["pos_in_block"] - d[ttc_col]
+    d = d[(d["tau"] >= 0) & (d["tau"] < d[lrandom_col])]          # L_Random, pre-switch
+    if tau_max is not None:
+        d = d[d["tau"] <= tau_max]
+    d = d[d[state_col].notna() & d["choice"].notna() & d["hr_side"].notna()]
+    d["_better"] = (d["choice"].to_numpy() == d["hr_side"].to_numpy()).astype(float)
+
+    rows = []
+    for animal, a in d.groupby(animal_col):
+        ex = a[a[state_col] == exploit_state]["_better"]
+        xp = a[a[state_col] == explore_state]["_better"]
+        if len(ex) < min_trials or len(xp) < min_trials:
+            continue
+        rows.append({"animal": animal,
+                     "p_better_exploit": float(ex.mean()),
+                     "p_better_explore": float(xp.mean()),
+                     "delta": float(ex.mean() - xp.mean()),
+                     "n_exploit": int(len(ex)), "n_explore": int(len(xp))})
+    tbl = pd.DataFrame(rows)
+    if len(tbl) < 5:
+        return {"table": tbl, "n": len(tbl), "median_delta": np.nan,
+                "wilcoxon_p": np.nan, "note": "too few animals"}
+
+    W, p = _stats.wilcoxon(tbl["delta"].to_numpy())
+    return {"table": tbl, "n": int(len(tbl)),
+            "p_better_exploit": float(tbl["p_better_exploit"].mean()),
+            "p_better_explore": float(tbl["p_better_explore"].mean()),
+            "median_delta": float(tbl["delta"].median()),
+            "frac_pos": float((tbl["delta"] > 0).mean()),
+            "wilcoxon_W": float(W), "wilcoxon_p": float(p)}
+
+
+def plot_choice_quality_by_state(res, exploit_label="exploit",
+                                 explore_label="explore",
+                                 outfile="choice_quality_by_state.png"):
+    """Paired per-animal plot of P(chose better) in exploit vs explore."""
+    font = _font()
+    tbl = res["table"]
+    fig, ax = plt.subplots(figsize=(6.4, 5.0))
+    fig.patch.set_facecolor(CREAM); ax.set_facecolor(CREAM)
+    C_EX = STATE_COLORS[0]; C_XP = STATE_COLORS[1]
+    for _, r in tbl.iterrows():
+        ax.plot([0, 1], [r["p_better_exploit"], r["p_better_explore"]],
+                "-", color=MUTE, alpha=0.3, lw=0.8)
+    ax.plot(np.zeros(len(tbl)), tbl["p_better_exploit"], "o", color=C_EX, ms=6, alpha=0.75)
+    ax.plot(np.ones(len(tbl)), tbl["p_better_explore"], "o", color=C_XP, ms=6, alpha=0.75)
+    ax.hlines(tbl["p_better_exploit"].mean(), -0.18, 0.18, color=INK, lw=2.5)
+    ax.hlines(tbl["p_better_explore"].mean(), 0.82, 1.18, color=INK, lw=2.5)
+    ax.axhline(0.5, ls=":", color=GRID, lw=1.2)                  # chance
+    ax.text(1.02, 0.5, "chance", fontsize=8, color=MUTE, va="center", fontfamily=font)
+    ax.set_xticks([0, 1]); ax.set_xticklabels([exploit_label, explore_label], fontfamily=font)
+    ax.set_xlim(-0.4, 1.4); ax.set_ylim(0.3, 1.0)
+    ax.set_ylabel("P(chose better)  per animal", fontsize=10.5, fontfamily=font)
+    ax.set_title(f"Choice quality by state (pre-switch L_Random)\n"
+                 f"{exploit_label} {res['p_better_exploit']:.3f} vs "
+                 f"{explore_label} {res['p_better_explore']:.3f}, "
+                 f"Δ={res['median_delta']:+.3f}, p={res['wilcoxon_p']:.3g} (n={res['n']})",
+                 fontsize=12, weight="bold", color=INK, fontfamily=font)
+    ax.grid(True, axis="y", color=GRID, lw=0.6, alpha=0.6)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    fig.tight_layout()
+    Path(outfile).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(outfile, facecolor=CREAM, bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    return outfile
 
 
 def compare_two_states_lrandom(

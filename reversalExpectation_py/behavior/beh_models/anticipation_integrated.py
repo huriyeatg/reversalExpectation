@@ -264,6 +264,77 @@ def history_matched_anticipation(d, outcome="chose_worse", n_boot=5000, seed=0):
     return res
 
 
+def history_matched_by_prev_reward(d, outcome="chose_worse", n_boot=5000, seed=0):
+    """Run the matched late-vs-early estimator SEPARATELY for trials that
+    followed a reward (R_{t-1}=1) and a non-reward (R_{t-1}=0). Because R_{t-1}
+    is part of the matching signature, every stratum has a single R_{t-1} value,
+    so the split keeps strata intact. Also tests whether the two per-mouse Deltas
+    differ (paired Wilcoxon on Delta_rewarded - Delta_unrewarded).
+
+    Returns a dict with the rewarded / unrewarded group tests, their per-mouse
+    deltas, and the between-condition difference test."""
+    res = {}
+    deltas = {}
+    for lab, val in [("rewarded", 1), ("unrewarded", 0)]:
+        sub = d[d["R1"] == val]
+        delta, retention = _matched_delta(sub, outcome)
+        g = _group_test(delta, n_boot=n_boot, seed=seed)
+        g.update({"retention": float(retention), "delta": delta, "n_trials": int(len(sub))})
+        res[lab] = g
+        deltas[lab] = delta
+
+    # paired difference across mice (rewarded - unrewarded), same mice only
+    paired = pd.concat([deltas["rewarded"].rename("rew"),
+                        deltas["unrewarded"].rename("unrew")], axis=1).dropna()
+    if len(paired) >= 5:
+        diff = (paired["rew"] - paired["unrew"]).to_numpy()
+        W, p = _stats.wilcoxon(diff)
+        res["difference"] = {"n": int(len(paired)),
+                             "median_diff": float(np.median(diff)),
+                             "wilcoxon_p": float(p)}
+    else:
+        res["difference"] = {"n": int(len(paired)), "median_diff": np.nan,
+                             "wilcoxon_p": np.nan}
+    res["outcome"] = outcome
+    return res
+
+
+def make_prev_reward_figure(split, outcome_label="chose worse",
+                            outfile="anticipation_by_prev_reward.png"):
+    """Two-condition dot plot: per-mouse late-minus-early Delta for trials
+    following reward vs non-reward, side by side, with medians and the
+    between-condition test."""
+    font = _font()
+    fig, ax = plt.subplots(figsize=(7.4, 5.0))
+    fig.patch.set_facecolor(CREAM); ax.set_facecolor(CREAM)
+    ax.axhline(0, color=MUTE, ls="--", lw=1)
+    conds = [("rewarded", GREEN, "after reward\n(R$_{t-1}$=1)"),
+             ("unrewarded", CORAL, "after non-reward\n(R$_{t-1}$=0)")]
+    rng = np.random.default_rng(0)
+    for i, (key, col, lab) in enumerate(conds):
+        x = split[key]["delta"].dropna().to_numpy()
+        j = i + rng.uniform(-0.09, 0.09, len(x))
+        ax.scatter(j, x, s=26, color=col, alpha=0.7, edgecolor="white", lw=0.5)
+        ax.hlines(np.median(x), i - 0.22, i + 0.22, color=INK, lw=2.5)
+        ax.text(i, ax.get_ylim()[1], f"median {np.median(x):+.4f}\np={split[key]['wilcoxon_p']:.3g}",
+                ha="center", va="top", fontsize=8.5, fontfamily=font, color=col)
+    ax.set_xticks([0, 1]); ax.set_xticklabels([c[2] for c in conds], fontfamily=font)
+    ax.set_ylabel(f"late − early  Δ({outcome_label})   per mouse", fontsize=10.5, fontfamily=font)
+    diff = split["difference"]
+    ax.set_title(f"History-matched anticipation by previous reward\n"
+                 f"difference (rew − unrew): median {diff['median_diff']:+.4f}, "
+                 f"p={diff['wilcoxon_p']:.3g} (n={diff['n']})",
+                 fontsize=12, weight="bold", color=INK, fontfamily=font)
+    ax.grid(True, color=GRID, lw=0.6, alpha=0.6)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    fig.tight_layout()
+    Path(outfile).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(outfile, facecolor=CREAM, bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    return outfile
+
+
 # ---------------------------------------------------------------------------
 # Analysis 3: complementary regression (robustness for better->worse)
 # ---------------------------------------------------------------------------
