@@ -13,7 +13,7 @@ the behaviour CSV produced by the revExp pipeline as the data interface.
     python run_glmhmm.py
 
 Compute note: a single global GLM-HMM fit costs ~1 min per animal-worth of data
-(~17k trials, 40 EM iters). The full 616-session dataset is a batch/cluster job.
+(~17k trials, 40 EM iters). The full 594-session dataset is a batch/cluster job.
 Start with SUBSET_N_ANIMALS set to a small number to gauge cost, then scale.
 
 K selection: held-out LL plateaus after K=2 (the K=2->K=3 and K=3->K=4 gains
@@ -81,7 +81,7 @@ PARAMETRIZATION = "ashwood_wsls"   # "ashwood_wsls" (faithful) | "reward_perseve
 SUBSET_N_ANIMALS = None
 
 K_RANGE     = (1, 2, 3, 4)   # swept by the CV (needed for the K-selection curve)
-CHOSEN_K    = 3              # final model + state-stability (must be in K_RANGE)
+CHOSEN_K    = 2              # final model + state-stability (must be in K_RANGE)
 N_RESTARTS  = 15
 N_ITERS     = 200
 N_FOLDS     = 5
@@ -90,9 +90,9 @@ N_JOBS      = -1             # parallel workers for CV / comparison / final fit 
 RUN_CV           = False     # cross-validate held-out LL across K
 RUN_COMPARISON   = False     # GLM vs lapse vs GLM-HMM(CHOSEN_K)
 RUN_KSELECTION   = False     # slide figures: CV curve + state-stability
-RUN_ANTICIPATION = True     # anticipation test (P(worse|tau) in L_Random)
-RUN_STATE_OCCUPANCY = False  # state occupancy: block-end aligned + within-session
-RUN_PER_SESSION_OCCUPANCY = True  # one figure per session (~616 files); slow, off by default
+RUN_ANTICIPATION = False     # anticipation test (P(worse|tau) in L_Random)
+RUN_STATE_OCCUPANCY = True  # state occupancy: block-end aligned + within-session
+RUN_PER_SESSION_OCCUPANCY = False  # one figure per session (~594 files); slow, off by default
 
 # FORCE_REFIT: if True, always re-fit the GLM-HMM and OVERWRITE glmhmm_states.csv,
 # even when that cache already exists. Use it whenever the model or the data
@@ -226,7 +226,7 @@ def main():
         # inputs are needed only for the fit / stability / anticipation blocks
         ch, inp, mk, tags = g.build_glmhmm_inputs(df, parametrization=PARAMETRIZATION)
         print(f"\n=== Final fit (all selected sessions, K={CHOSEN_K}) ===")
-        _, glm_w = g.fit_glm(ch, inp, mk, n_jobs=N_JOBS)
+        glm_model, glm_w = g.fit_glm(ch, inp, mk, n_jobs=N_JOBS)
         model = g.fit_global_glmhmm(ch, inp, mk, K=CHOSEN_K, glm_weights=glm_w,
                                     n_restarts=N_RESTARTS, n_iters=N_ITERS, n_jobs=N_JOBS)
         weights_df = g.glmhmm_weights(model, parametrization=PARAMETRIZATION)
@@ -238,6 +238,19 @@ def main():
         engaged_idx = int(weights_df.set_index("state")["prev_choice"].idxmax())
         print(f"engaged state index = {engaged_idx}")
         did_fit = True
+
+        # Persist the fitted global model so that NEW sessions (e.g. the
+        # neuromodulator imaging sessions, which are not in the behavioral CSV)
+        # can be decoded with the SAME frozen parameters -- see glmhmm_decode.py.
+        import pickle
+        model_pkl = OUTPUT_DIR / f"glmhmm_model_{PARAMETRIZATION}_K{CHOSEN_K}.pkl"
+        with open(model_pkl, "wb") as fh:
+            pickle.dump({"model": model, "glm_model": glm_model, "K": CHOSEN_K,
+                         "parametrization": PARAMETRIZATION,
+                         "n_lags": g.N_LAGS, "engaged_idx": engaged_idx,
+                         "weights": weights_df,
+                         "transition_matrix": g.glmhmm_transition_matrix(model)}, fh)
+        print(f"wrote {model_pkl}")
 
     # ---- state occupancy: CACHE-OR-FIT ------------------------------------
     # Exactly what this block does, depending on whether the fit ran above:

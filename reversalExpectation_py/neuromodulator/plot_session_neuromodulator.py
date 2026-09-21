@@ -3,17 +3,24 @@ plot_session_neuromodulator.py
 ==============================
 Port of plot_session_neuromodulator.m (H Atilgan & AC Kwan).
 
-Creates two figures per session / per animal:
+Figure 1 ('session') — 3 panels sharing the SAME x axis (trial):
+    1. Reward probabilities (left = red, right = blue)
+    2. Choice + outcome per trial (bars; black = rewarded, with a white strip
+       separating the reward mark from the choice mark)
+    3. dF/F as an image: x = trial, y = time (-1.95 to 4 s), as in
+       imagesc(1:nTrials, tWindow, trials.dff') in the .m
+Figure 2 ('neuralSignal') — ONE snake plot with ALL trials (trials.dff).
 
-  Figure 1 — session overview (3 subplots):
-    1. Reward probabilities over trials (left=red, right=blue)
-    2. Trial-by-trial choice + outcome timeline
-    3. dF/F heatmap (imagesc over time × trial)
-
-  Figure 2 — snake plot (one subplot per trial type):
-    HR-reward, HR-no-reward, LR-reward, LR-no-reward
-
-Saves PNG files to save_path when provided.
+Changes vs. the previous port (which departed from the .m):
+  - n_plot = 100*ceil(n/100). The port used max(n,100)*ceil(n/100): with
+    n~900 that gave 8100 and squeezed the data against the left edge.
+  - Panel 3 with trials on x (it had time on x, misaligned with panels 1-2).
+  - Figure 2 = a single snake of all trials (it had 4 trial types; that is
+    what bandit_neuromodulatorPerSession.m does, not this .m).
+  - White bars at ±0.8 as in the .m.
+Note: the .m labels sample 1 as -1.95 s, but in creatDffMatFiles sample 41 is
+the cue, so sample 1 is -2.00 s (the .m axis is shifted by 50 ms). The .m axis
+is kept for fidelity (T_AXIS).
 """
 
 import warnings
@@ -26,8 +33,8 @@ from .plot_snake import plot_snake
 
 
 FS       = 20
-T_WINDOW = 120       # 6 s × 20 Hz, mirrors create_dff_files.py
-T_AXIS   = np.linspace(-1.95, 4.0, T_WINDOW)   # -1.95:1/20:4
+T_WINDOW = 120                                   # 6 s × 20 Hz
+T_AXIS   = np.round(np.arange(-1.95, 4.0 + 1e-9, 1.0 / FS), 4)   # -1.95:1/20:4 (120 pts)
 
 
 def plot_session_neuromodulator(
@@ -37,149 +44,76 @@ def plot_session_neuromodulator(
     save_path: str = None,
 ) -> tuple:
     """
-    Parameters
-    ----------
-    stats     : dict from get_trial_stats_more() — must contain c, r, rewardprob
-    trials    : dict from get_trial_masks() or merge_sessions_neuromodulator()
-                — must contain dff (n_trials × T_WINDOW)
-    tlabel    : figure title (animal ID or session filename)
-    save_path : directory to save figures; None → do not save.
-
-    Returns
-    -------
-    (fig_session, fig_neural) — two matplotlib Figure objects
+    stats     : dict from get_trial_stats_more() — c, r, rewardprob
+    trials    : dict with 'dff' (n_trials × T_WINDOW)
+    tlabel    : title (animal or session)
+    save_path : folder where 'session.png' and 'neuralSignal.png' are saved
     """
-    c          = np.asarray(stats.get("c", []), float)
-    r          = np.asarray(stats.get("r", []), float)
-    rewardprob = np.asarray(stats.get("rewardprob",
-                             np.full((len(c), 2), np.nan)), float)
+    c = np.asarray(stats.get("c", []), float).ravel()
+    r = np.asarray(stats.get("r", []), float).ravel()
+    rewardprob = np.asarray(stats.get("rewardprob", np.full((len(c), 2), np.nan)), float)
 
     dff_raw = trials.get("dff", None)
     if dff_raw is None:
-        warnings.warn("trials dict has no 'dff' key — neural subplot will be empty.")
+        warnings.warn("trials has no 'dff' — the neural panel will be empty.")
         dff_raw = np.full((len(c), T_WINDOW), np.nan)
+    dff = np.asarray(dff_raw, float)[:, :T_WINDOW]
 
-    dff = np.asarray(dff_raw, float)
-    n   = min(len(c), len(dff))
-    c          = c[:n]
-    r          = r[:n]
-    rewardprob = rewardprob[:n, :]
-    dff        = dff[:n, :T_WINDOW]
-
-    n_plot = max(n, 100) * int(np.ceil(n / 100)) if n > 0 else 100
+    n_c = len(c)
+    n_plot = int(100 * np.ceil(n_c / 100)) if n_c > 0 else 100   # .m: 100*ceil(numel(stats.c)/100)
 
     # ------------------------------------------------------------------ #
-    # Figure 1 — session overview
+    # Figure 1
     # ------------------------------------------------------------------ #
     fig1, axes = plt.subplots(3, 1, figsize=(14, 9))
 
-    # Subplot 1: reward probabilities
     ax = axes[0]
-    ax.plot(rewardprob[:, 0], "r", linewidth=2, label="Left")
-    ax.plot(rewardprob[:, 1], "b", linewidth=2, label="Right")
-    ax.set_ylabel("Reward probability")
-    ax.set_xlim(0, n_plot)
-    ax.set_ylim(0, 1)
-    ax.set_yticks([0, 0.1, 0.7, 1])
-    ax.set_yticklabels(["", "10 %", "70 %", ""])
-    ax.legend(frameon=False, fontsize=10)
+    ax.plot(np.arange(1, len(rewardprob) + 1), rewardprob[:, 0], "r", lw=2, label="Left")
+    ax.plot(np.arange(1, len(rewardprob) + 1), rewardprob[:, 1], "b", lw=2, label="Right")
+    ax.set_ylabel("Reward probability (%)")
+    ax.legend(frameon=False)
+    ax.set_xlim(0, n_plot); ax.set_ylim(0, 1)
     ax.set_xticklabels([])
-    ax.set_title(tlabel, fontsize=12)
-    ax.spines[["top", "right"]].set_visible(False)
+    ax.set_yticks([0, 0.1, 0.7, 1]); ax.set_yticklabels(["", "10", "70", ""])
+    ax.set_title(tlabel)
 
-    # Subplot 2: choice + outcome timeline
     ax = axes[1]
-    x = np.arange(n)
-
-    left_mask  = (c == -1)
-    right_mask = (c ==  1)
-    left_rew   = left_mask  & (r == 1)
-    right_rew  = right_mask & (r == 1)
-
-    # Mirrors MATLAB: bars at ±0.7 for choice, ±1 for rewarded choice
-    h_left  = np.where(left_mask,  -0.7, 0.0)
-    h_right = np.where(right_mask,  0.7, 0.0)
-    h_lrew  = np.where(left_rew,   -1.0, 0.0)
-    h_rrew  = np.where(right_rew,   1.0, 0.0)
-
-    ax.bar(x, h_left,  width=1, color="r", linewidth=0)
-    ax.bar(x, h_right, width=1, color="b", linewidth=0)
-    ax.bar(x, h_lrew,  width=1, color="k", linewidth=0)
-    ax.bar(x, h_rrew,  width=1, color="k", linewidth=0)
-
+    x = np.arange(1, n_c + 1)                     # MATLAB bar() places bar i at x = i
+    L, R = (c == -1), (c == 1)
+    Lr, Rr = L & (r == 1), R & (r == 1)
+    # same drawing order as the .m: black, white (gap), color
+    for h, col in [(-1.0 * Lr, "k"), (-0.8 * Lr, "w"), (-0.7 * L, "r"),
+                   (1.0 * Rr, "k"), (0.8 * Rr, "w"), (0.7 * R, "b")]:
+        ax.bar(x, h, width=1, color=col, edgecolor="none")
     ax.set_ylabel("Choice")
-    ax.set_xlim(0, n_plot)
-    ax.set_ylim(-1, 1)
-    ax.set_yticks([-1, -0.7, 0.7, 1])
-    ax.set_yticklabels(["Reward", "Left", "Right", "Reward"])
-    n_rew  = int(np.nansum(r == 1))
-    n_resp = int(np.nansum(~np.isnan(r)))
-    rr     = n_rew / n_resp if n_resp else float("nan")
-    ax.set_title(f"Overall reward rate = {rr:.2f}", fontsize=10)
-    ax.spines[["top", "right"]].set_visible(False)
+    ax.set_xlim(0, n_plot); ax.set_ylim(-1, 1)
+    ax.set_xlabel("Trial")
+    ax.set_yticks([-1, -0.7, 0.7, 1]); ax.set_yticklabels(["Reward", "Left", "Right", "Reward"])
+    n1, n0 = int(np.sum(r == 1)), int(np.sum(r == 0))
+    ax.set_title(f"Overall reward rate = {n1 / (n1 + n0) if (n1 + n0) else np.nan:.4g}")
 
-    # Subplot 3: dF/F heatmap
     ax = axes[2]
-    im = ax.imshow(
-        dff,
-        aspect="auto",
-        extent=[T_AXIS[0], T_AXIS[-1], n, 0],
-        cmap="OrRd",
-        interpolation="nearest",
-    )
-    ax.set_xlim(T_AXIS[0], T_AXIS[-1])
-    ax.set_ylim(n, 0)
-    ax.set_xlabel("Time (sec)")
-    ax.set_ylabel("Trial")
-    plt.colorbar(im, ax=ax, shrink=0.8)
-    ax.spines[["top", "right"]].set_visible(False)
+    n_tr = dff.shape[0]
+    cmap = plt.get_cmap("OrRd")
+    # imagesc(1:nTrials, tWindow, dff'): x = trial, y = time (y increases upward because of 'hold on')
+    ax.imshow(dff.T, aspect="auto", cmap=cmap, origin="lower", interpolation="nearest",
+              extent=[0.5, n_tr + 0.5, T_AXIS[0] - 0.025, T_AXIS[-1] + 0.025])
+    ax.set_xlim(0, n_plot); ax.set_ylim(-2, 4)
+    ax.set_xlabel("Trial"); ax.set_ylabel("Time (sec)")
 
     fig1.tight_layout()
 
     # ------------------------------------------------------------------ #
-    # Figure 2 — snake plots per trial type (4 subplots)
+    # Figure 2 — one snake plot with all trials (.m: plot_snake(temp_psth,[0 6.5],...))
     # ------------------------------------------------------------------ #
-    bool_masks = {
-        k: np.asarray(v, dtype=bool)[:n]
-        for k, v in trials.items()
-        if hasattr(v, "__len__") and np.asarray(v).ndim == 1
-    }
+    fig2, ax2 = plt.subplots(figsize=(6, 6))
+    plot_snake(dff, T_AXIS[: dff.shape[1]], label=" ", ax=ax2)
+    ax2.set_xlabel("Time from stimulus (s)")
 
-    def _get(fields1, fields2=None):
-        """AND fields1, AND fields2, then OR both groups."""
-        def _and(fields):
-            out = np.ones(n, dtype=bool)
-            for f in fields:
-                if f in bool_masks:
-                    out &= bool_masks[f]
-            return out
-        m1 = _and(fields1)
-        if fields2:
-            return m1 | _and(fields2)
-        return m1
-
-    conditions = [
-        ("HR reward",    _get(["left","reward","L70R10"], ["right","reward","L10R70"])),
-        ("HR no-reward", _get(["left","noreward","L70R10"], ["right","noreward","L10R70"])),
-        ("LR reward",    _get(["left","reward","L10R70"], ["right","reward","L70R10"])),
-        ("LR no-reward", _get(["left","noreward","L10R70"], ["right","noreward","L70R10"])),
-    ]
-
-    fig2, axes2 = plt.subplots(1, 4, figsize=(20, 5))
-    for ax2, (lbl, mask) in zip(axes2, conditions):
-        subset = dff[mask, :] if np.any(mask) else np.full((1, T_WINDOW), np.nan)
-        plot_snake(subset, T_AXIS, label=lbl, ax=ax2)
-
-    fig2.suptitle(tlabel, fontsize=12)
-    fig2.tight_layout()
-
-    # ------------------------------------------------------------------ #
-    # Save
-    # ------------------------------------------------------------------ #
     if save_path:
         p = Path(save_path)
         p.mkdir(parents=True, exist_ok=True)
-        fig1.savefig(p / "session.png",      dpi=150, bbox_inches="tight")
+        fig1.savefig(p / "session.png", dpi=150, bbox_inches="tight")
         fig2.savefig(p / "neuralSignal.png", dpi=150, bbox_inches="tight")
         print(f"  Saved → {p / 'session.png'}")
         print(f"  Saved → {p / 'neuralSignal.png'}")

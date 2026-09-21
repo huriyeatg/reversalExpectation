@@ -114,8 +114,18 @@ def parse_logfile(log_path: Path) -> Dict:
 
     # ---- Build arrays ----
     TYPE = np.array([p[2].strip() for p in data_lines])
-    TIME_raw = np.array([float(p[4]) if p[4].strip() else np.nan
-                         for p in data_lines])
+
+    # parseLogfile.m reads every column as a string and value_getSessionData.m
+    # converts with str2double, which returns NaN for ANY non-numeric text.
+    # float() raises instead -- e.g. on text in the summary table that
+    # Presentation appends after the event table -- so convert the same way.
+    def _str2double(x):
+        try:
+            return float(x)
+        except ValueError:
+            return np.nan
+
+    TIME_raw = np.array([_str2double(p[4].strip()) for p in data_lines])
 
     # CODE: mostly numeric but sometimes strings like "BlockLen_13"
     CODE_str = [p[3].strip() for p in data_lines]
@@ -161,14 +171,13 @@ def get_session_data(log_data: Dict, phase: int) -> Tuple[Dict, Dict]:
     CODE = log_data["CODE"]
     TIME = log_data["TIME"]
 
-    # Remove Port events (shouldn't exist, but replicate the MATLAB check)
+    # Port events: value_getSessionData.m raises an error here (the removal
+    # code after error() is unreachable), so those sessions never produced a
+    # _beh.mat. Replicate the error instead of silently removing the events.
     port_mask = TYPE == "Port"
     if port_mask.any():
-        warnings.warn("Port events found — removing them (check Presentation settings)")
-        keep = ~port_mask
-        TYPE = TYPE[keep]
-        CODE = CODE[keep]
-        TIME = TIME[keep]
+        raise ValueError("Port code exists (INPUT unchecked in Presentation?) - "
+                         "value_getSessionData.m stops here; check this log manually")
 
     # Get all rule codes as array
     rule_codes_all = _rule_codes_as_array(rule)
@@ -289,7 +298,9 @@ def get_session_data(log_data: Dict, phase: int) -> Tuple[Dict, Dict]:
         "nTrials":    n_trials,
         "nRules":     n_rules,
         "lickTimes":  [lick_times_left, lick_times_right],
-        "rule_labels": list(RULE_LABELS.get(n_rules, {}).values()),
+        # .m: sessionData.rule_labels = fieldnames(RULE), e.g. ['L70R10', 'L10R70']
+        # (stats['rule_labels'] with the '0.7:0.1' strings comes from get_trial_stats)
+        "rule_labels": [f.name for f in __import__("dataclasses").fields(rule)],
     }
 
     trial_data = {

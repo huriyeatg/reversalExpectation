@@ -13,6 +13,24 @@ import numpy as np
 from preprocessing.presentation_codes import get_presentation_codes, REWARD_PROBS, RULE_LABELS
 
 
+def _bool_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    Safely coerce a trial mask to boolean for use as a numpy index.
+
+    get_trial_masks() returns pure booleans for a single session, but
+    merge_sessions (both behavior/ and neuromodulator/ versions) insert NaN
+    "gap" rows between concatenated sessions, which promotes the whole mask
+    array to float64 -- and float arrays can't be used as boolean indices
+    ("arrays used as indices must be of integer (or boolean) type").
+    mask.astype(bool) directly would be WRONG here: NaN casts to True in
+    numpy (NaN != 0), so every gap trial would be marked True for every
+    mask. Route NaN -> 0.0 -> False first instead.
+    """
+    if mask.dtype == bool:
+        return mask
+    return np.nan_to_num(np.asarray(mask, dtype=float), nan=0.0).astype(bool)
+
+
 # ---------------------------------------------------------------------------
 # value_getTrialMasks.m
 # ---------------------------------------------------------------------------
@@ -69,13 +87,14 @@ def get_trial_masks(trial_data: dict) -> dict:
         trials["L10R30"] = rule_arr == rule.L10R30
 
     # --- Consistency checks (mirrors MATLAB) ---
-    n = len(cue)
+    # .m: nTrials = numel(trialData.cueTimes); check #2 is in an ELSEIF, so it
+    # only runs (and only raises) when check #1 passed.
+    n = len(trial_data["cueTimes"]) if "cueTimes" in trial_data else len(cue)
     n_outcome = trials["reward"].sum() + trials["noreward"].sum() + trials["miss"].sum()
+    n_response = trials["left"].sum() + trials["right"].sum() + trials["miss"].sum()
     if n_outcome != n:
         warnings.warn(f"check #1 failed: reward+noreward+miss={n_outcome} vs nTrials={n}")
-
-    n_response = trials["left"].sum() + trials["right"].sum() + trials["miss"].sum()
-    if n_response != n:
+    elif n_response != n:
         raise ValueError(
             f"check #2 failed: left+right+miss={n_response} vs nTrials={n}"
         )
@@ -119,13 +138,13 @@ def get_trial_stats(trials: dict, n_rules: int) -> dict:
 
     # choice: left=-1, right=1, miss=NaN
     c = np.full(n, np.nan)
-    c[trials["left"]]  = -1.0
-    c[trials["right"]] =  1.0
+    c[_bool_mask(trials["left"])]  = -1.0
+    c[_bool_mask(trials["right"])] =  1.0
 
     # outcome: reward=1, noreward=0, miss=NaN
     r = np.full(n, np.nan)
-    r[trials["reward"]]   = 1.0
-    r[trials["noreward"]] = 0.0
+    r[_bool_mask(trials["reward"])]   = 1.0
+    r[_bool_mask(trials["noreward"])] = 0.0
 
     # rule index
     rule = np.full(n, np.nan)
@@ -133,14 +152,14 @@ def get_trial_stats(trials: dict, n_rules: int) -> dict:
     rule_labels_map = RULE_LABELS.get(n_rules, {})
 
     if n_rules == 2:
-        rule[trials["L70R10"]] = 1
-        rule[trials["L10R70"]] = 2
+        rule[_bool_mask(trials["L70R10"])] = 1
+        rule[_bool_mask(trials["L10R70"])] = 2
     elif n_rules == 6:
         for idx, key in enumerate(
             ["L70R30","L70R10","L30R10","L30R70","L10R70","L10R30"], start=1
         ):
             if key in trials:
-                rule[trials[key]] = idx
+                rule[_bool_mask(trials[key])] = idx
 
     # reward probabilities per trial
     rewardprob = np.full((n, 2), np.nan)

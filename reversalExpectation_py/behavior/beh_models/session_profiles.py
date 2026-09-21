@@ -1,7 +1,7 @@
 """
 session_profiles.py
 ===================
-Cluster the 616 sessions into behavioural "profiles" by the SHAPE of their
+Cluster the 594 sessions into behavioural "profiles" by the SHAPE of their
 GLM-HMM state trajectory across the session.
 
 Each session is represented not by its PNG but by the DATA behind it: the

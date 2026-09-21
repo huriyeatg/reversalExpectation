@@ -75,7 +75,11 @@ def per_session_neuromodulator(data_index: pd.DataFrame,
         dff  = npz["dff"]
         dffN = npz["dffN"]
 
-        # Align trial counts
+        # .m: trials.dff = data.dff(1:end-1, 1:tWindow) -> the last row is dropped
+        # (on top of the one create_dff_files already drops with numel(stamps)-1)
+        dff, dffN = dff[:-1], dffN[:-1]
+
+        # Align trial counts (.m: nTrials = min(numel(trials.go), size(trials.dffN,1)))
         n = min(len(trial_data["cue"]), len(dff))
         dff  = dff[:n, :T_WINDOW]
         dffN = dffN[:n, :T_WINDOW]

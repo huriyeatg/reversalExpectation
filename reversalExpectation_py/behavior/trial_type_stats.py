@@ -12,6 +12,8 @@ stratified by trial type.
 import numpy as np
 from typing import List, Union
 
+from .trial_processing import _bool_mask
+
 
 TrialTypeSpec = Union[str, List[str]]
 
@@ -60,11 +62,14 @@ def get_lickrate_by_trial_type(
     trial_labels = []
 
     for tt in trial_types:
+        # _bool_mask, not .astype(bool): masks from merged sessions carry NaN gap
+        # rows, and NaN.astype(bool) is True -> every gap trial would be counted
+        # as selected (inflating n_sel and deflating the lick rate in Hz).
         if isinstance(tt, str):
-            mask  = trials[tt].astype(bool)
+            mask  = _bool_mask(np.asarray(trials[tt]))
             label = tt
         elif len(tt) == 2:
-            mask  = trials[tt[0]].astype(bool) & trials[tt[1]].astype(bool)
+            mask  = _bool_mask(np.asarray(trials[tt[0]])) & _bool_mask(np.asarray(trials[tt[1]]))
             label = f"{tt[0]} + {tt[1]}"
         else:
             raise ValueError(
@@ -76,14 +81,18 @@ def get_lickrate_by_trial_type(
         n_sel = int(mask.sum())
 
         def _hist(lick_list):
-            all_times = np.concatenate(
-                [np.asarray(t, dtype=float).ravel()
-                 for t in lick_list
-                 if t is not None and len(np.asarray(t).ravel()) > 0],
-                axis=0,
-            ) if n_sel > 0 else np.array([])
-            if len(all_times) == 0 or n_sel == 0:
+            # No selected trials -> rate undefined (NaN). Selected trials but no
+            # licks on this side -> rate is 0 Hz, not NaN. (np.concatenate on an
+            # empty list raised "need at least one array to concatenate".)
+            if n_sel == 0:
                 return np.full(n_bins, np.nan)
+            arrays = [np.asarray(t, dtype=float).ravel()
+                      for t in lick_list if t is not None]
+            arrays = [a for a in arrays if a.size > 0]
+            if not arrays:
+                return np.zeros(n_bins)
+            all_times = np.concatenate(arrays)
+            all_times = all_times[np.isfinite(all_times)]   # NaN gap placeholders
             counts, _ = np.histogram(all_times, bins=edges)
             return counts.astype(float) / n_sel / edge_width  # Hz
 

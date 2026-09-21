@@ -20,13 +20,44 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.ndimage import uniform_filter1d
 
 
 FS      = 20        # miniscope sample rate (Hz)
 PRE_S   = 2         # seconds before cue to include
 POST_S  = 4         # seconds after cue to include
 T_WINDOW = int((PRE_S + POST_S) * FS)   # total samples per trial
+
+# The real timeEvents.csv header is "Time (s), Channel Name, Value" (note the
+# space after each comma, so pandas' default read_csv gives column names like
+# "Time (s)" and " Channel Name" -- not the ChannelName / Time_s_ names this
+# module expects). Those expected names come from how MATLAB's readtable
+# auto-sanitizes headers (strips spaces/parens into valid identifiers);
+# pandas doesn't do that automatically. The column ORDER is fixed, so rename
+# positionally instead of relying on exact header text -- robust to stray
+# whitespace/casing differences across files.
+_TIME_EVENTS_COLS = ["Time_s_", "ChannelName", "Value"]
+
+# "add shutter time delay" in the .m: data.signal_t = t + (1:N)'*0.00001.
+# It is CUMULATIVE (0.36 s by the end of 30 min at 20 Hz). It only makes sense if
+# the trace times are nominal and the real clock runs ~200 ppm slower.
+# Kept for fidelity to the .m; verify_neuromodulator_alignment.py (section 4)
+# tells whether it applies. "matlab" = as in the .m | "none" = no shift.
+SHUTTER_DELAY_MODE = "matlab"
+
+
+def movmean_matlab(x: np.ndarray, k: int) -> np.ndarray:
+    """MATLAB movmean(x, k): centered window; for even k it covers [i-k/2, i+k/2-1];
+    at the ends the window SHRINKS ('shrink' endpoints) instead of padding.
+    (uniform_filter1d(mode='nearest') matches in the interior but differs in the
+    first and last minute of the session.)"""
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    before = k // 2 if k % 2 == 0 else (k - 1) // 2
+    after = k // 2 - 1 if k % 2 == 0 else (k - 1) // 2
+    cs = np.concatenate([[0.0], np.cumsum(x)])
+    i = np.arange(n)
+    lo, hi = np.maximum(0, i - before), np.minimum(n, i + after + 1)
+    return (cs[hi] - cs[lo]) / (hi - lo)
 
 
 def create_dff_files(data_index: pd.DataFrame) -> pd.DataFrame:
@@ -79,13 +110,18 @@ def _process_session(row) -> tuple:
     raw = pd.read_csv(cell_path, skiprows=2, header=None)
     signal_t   = raw.iloc[:, 0].values.astype(float)
     raw_signal = raw.iloc[:, 1].values.astype(float)
-    # Add tiny shutter-time jitter (mirrors MATLAB original)
-    signal_t = signal_t + np.arange(1, len(signal_t) + 1) * 1e-5
+    # "add shutter time delay" (see SHUTTER_DELAY_MODE above)
+    if SHUTTER_DELAY_MODE == "matlab":
+        signal_t = signal_t + np.arange(1, len(signal_t) + 1) * 1e-5
 
     # --- Load trial trigger times (timeEvents CSV) ---
     te_path = neural_path / row["time_events_filename"]
     te = pd.read_csv(te_path)
-    io1 = te[te["ChannelName"] == "IO1"]
+    if len(te.columns) != len(_TIME_EVENTS_COLS):
+        raise ValueError(f"{te_path.name}: expected {len(_TIME_EVENTS_COLS)} "
+                         f"columns, got {len(te.columns)} ({list(te.columns)})")
+    te.columns = _TIME_EVENTS_COLS
+    io1 = te[te["ChannelName"].astype(str).str.strip() == "IO1"]
     times  = io1["Time_s_"].values.astype(float)
     values = io1["Value"].values.astype(float)
 
@@ -93,9 +129,9 @@ def _process_session(row) -> tuple:
     transitions = np.where(values[:-1] != values[1:])[0]
     trial_stamps = times[transitions][1::2]   # mirrors MATLAB trialStamps(2:2:end)
 
-    # --- Detrend: 2-minute moving average ---
+    # --- Detrend: 2-minute moving average (movmean as in the .m, 'shrink' endpoints) ---
     window = int(FS * 60 * 2)
-    trend  = uniform_filter1d(raw_signal, size=window, mode="nearest")
+    trend  = movmean_matlab(raw_signal, window)
     signal = (raw_signal - trend) / np.nanmean(raw_signal)
 
     # --- Epoch into per-trial windows ---
@@ -110,16 +146,21 @@ def _process_session(row) -> tuple:
         end_idx = int(np.argmin(np.abs(signal_t - trial_stamps[k + 1])))
         start   = st_idx - pre_samp
 
-        if start <= 0:
+        # .m: ind(1) <= 0 with 1-based indices  <=>  start < 0 with 0-based ones.
+        # (the previous "start <= 0" wrongly treated start == 0 as the first-trial case)
+        if start < 0:
             # Not enough pre-cue signal for first trial
             seg = signal[st_idx:end_idx]
-            n   = len(seg)
-            dff[k,  pre_samp:pre_samp + n] = seg
-            dffN[k, pre_samp:pre_samp + n] = seg
+            n   = min(len(seg), T_WINDOW - pre_samp)   # cap to what actually fits
+            dff[k,  pre_samp:pre_samp + n] = seg[:n]
+            dffN[k, pre_samp:pre_samp + n] = seg[:n]
         else:
             seg = signal[start:end_idx]
             n   = min(len(seg), T_WINDOW)
             dff[k, :n]  = seg[:n]
+            # Note: the .m does not preallocate data.dff, so MATLAB fills unassigned
+            # positions of short trials with ZEROS; here they stay NaN
+            # (deliberate divergence: a zero would be a fake data point).
             baseline     = np.nanmean(signal[start:start + pre_samp])
             dffN[k, :n] = seg[:n] - baseline
 

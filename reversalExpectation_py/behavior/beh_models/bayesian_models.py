@@ -107,6 +107,23 @@ def belief_trial_loglikes(params, c, r, n_rules: int = 2,
     """
     Per-trial log-likelihood of the observed choice under the belief model.
 
+    TRIAL ORDER AND THE MEANING OF beta
+    -----------------------------------
+    Here each trial runs transition -> decide -> Bayes, so the decision uses
+    T(b) = b(1-H) + 0.5H. Murphy et al. (Methods) run decide -> transition ->
+    Bayes (the switch possibility and the Bayes update are applied "at the end
+    of each trial"), as belief_vhr.py does. Because q_diff is linear in the
+    belief, q_diff(T(b)) = (1-H) * q_diff(b), so the two orderings are the SAME
+    model up to a reparametrization of the inverse temperature:
+
+        beta_Murphy = beta_here * (1 - H)
+
+    Maximum likelihood, BIC, H, alpha_k and beta_k are identical under both
+    orderings (checked numerically, misses included). Only the reported beta
+    differs: convert with the formula above before comparing beta, or ratios
+    involving beta (e.g. beta / beta_k), with Murphy et al. or with belief_vhr.
+    The same applies to belief_ck_trial_loglikes.
+
     The belief propagates through every trial (including misses, which leave it
     unchanged). The returned array has one entry per trial: log P(observed
     choice) on choice trials, NaN on misses. Scoring a subset of trials is the

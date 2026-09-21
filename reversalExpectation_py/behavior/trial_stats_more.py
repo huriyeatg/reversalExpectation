@@ -1,216 +1,166 @@
 """
 trial_stats_more.py
 ===================
-Exact translation of value_getTrialStatsMore.m
-(H Atilgan & AC Kwan).
+Faithful translation of value_getTrialStatsMore.m (H Atilgan & AC Kwan 191202).
 
 Extends the stats dict produced by get_trial_stats() with block-level fields.
+
+Faithfulness notes (what the .m does, and where this port deliberately differs)
+------------------------------------------------------------------------------
+Same as the .m:
+  - hr_side is computed PER TRIAL from rewardprob (NaN where rule is NaN).
+  - Blocks come from run-length encoding of `rule` with `~=`. Because
+    NaN ~= NaN is true in MATLAB (and in numpy), every NaN gap trial of a
+    merged session is its own 1-trial block. A block followed by a NaN block
+    has no valid transition, so it gets no block-level stats (it is excluded),
+    exactly as in the .m.
+  - Block-level stats are computed only for blocks 1..nBlocks-1: the LAST block
+    of a session never switched, so its L_Random is right-censored and the .m
+    leaves it undefined. (The previous port computed ttc / L_Random for the
+    last block too; any analysis that did not drop it treated a censored
+    L_Random as a real switch -- e.g. belief_vhr.empirical_hazard.)
+  - Trials-to-criterion = trial of the 10th CUMULATIVE choice of the block's
+    high-reward side; L_Random = blockLength - trialsToCrit.
+  - pWinStay / pLooseSwitch use only the last 6 trials of the block (5 pairs),
+    with "stay" = same better/worse status on consecutive trials.
+  - hitrates / rewardrates are PERCENT, over ALL trials of the block (misses
+    count in the denominator) AND the first trial of the next block
+    (the .m indexes blockStart:blockEnd+1 -- an off-by-one in the original,
+    replicated here for fidelity).
+  - blockPreSwitch*ChoiceRate: last 5 trials; *AtSwitch: the last trial
+    (a miss counts as neither better nor worse -> 0).
+  - ruletransList = all possible (i, j), i != j, in the .m order.
+
+Deliberate differences:
+  - Block-level arrays have length nBlocks (last entry NaN) instead of
+    nBlocks-1, so callers can index them by block (master_behavior does).
+  - blockTrans stores the NEXT RULE NUMBER, not the index into ruletransList
+    (choice_switch.py builds its (from, to) lookup from blockRule + blockTrans).
+  - A block that never reaches criterion gets NaN for trials-to-criterion and
+    L_Random (the .m uses inf and -inf).
 """
 
+import warnings
+
 import numpy as np
+
+N_CRIT = 10            # criterion: 10 cumulative choices of the high-reward side
+N_PRESWITCH = 5        # trials before the switch for *ChoiceRate
+N_WSLS = 5             # trial pairs before the switch for pWinStay / pLooseSwitch
+
+
+def _eq(a, b):
+    """MATLAB-style == on floats: NaN == anything is False."""
+    return np.asarray(a, float) == b
 
 
 def get_trial_stats_more(stats: dict) -> dict:
     """
     Translation of value_getTrialStatsMore.m.
 
-    Parameters
-    ----------
-    stats : dict
-        Output of get_trial_stats(). Must contain:
-            c           : float array  (-1=left, 1=right, NaN=miss)
-            r           : float array  (1=reward, 0=noreward, NaN=miss)
-            rule        : float array  (rule index, NaN=miss)
-            rewardprob  : (nTrials, 2) array  [left_prob, right_prob]
-            rule_labels : list[str]
-
-    Returns
-    -------
-    stats : same dict, with added fields:
-
-    Block-level (length = nBlocks):
-        blockLength
-        blockRule
-        blockTrans                           (NaN for last block)
-        blockTrialtoCrit
-        blockTrialRandomAdded
-        blockPreSwitchBetterChoiceAtSwitch
-        blockPreSwitchWorseChoiceAtSwitch
-        rewardrates
-        hitrates
-        pWinStay
-        pLooseSwitch
-
-    Trial-level:
-        hr_side   : float array  (-1 = left is high-reward side, 1 = right)
-
-    Other:
-        ruletransList : (nTrans, 2) float array of unique [from, to] rule pairs
+    stats : output of get_trial_stats() with c, r, rule, rewardprob, rule_labels.
+    Returns the same dict with the block-level fields added (see module docstring).
     """
-    c          = stats["c"]
-    r          = stats["r"]
-    rule       = stats["rule"]
-    rewardprob = stats["rewardprob"]
-    n_trials   = len(c)
+    c = np.asarray(stats["c"], float)
+    r = np.asarray(stats["r"], float)
+    rule = np.asarray(stats["rule"], float)
+    rewardprob = np.asarray(stats["rewardprob"], float)
+    n_trials = len(c)
+    n_rules = len(stats["rule_labels"])
 
     # ------------------------------------------------------------------
-    # 1. Block boundaries  (mirrors MATLAB loop exactly)
-    # ------------------------------------------------------------------
-    block_start = [0]   # 0-indexed (MATLAB: 1-indexed blockStart=[1])
-
-    for t in range(1, n_trials):
-        prev_nan = np.isnan(rule[t - 1])
-        curr_nan = np.isnan(rule[t])
-
-        if not curr_nan and not prev_nan and rule[t] != rule[t - 1]:
-            block_start.append(t)
-        elif not curr_nan and prev_nan:
-            block_start.append(t)
-        # entering a NaN gap: do not mark yet
-
-    block_start = sorted(set(block_start))
-    n_blocks    = len(block_start)
-    block_end   = block_start[1:] + [n_trials]   # exclusive end
-
-    # ------------------------------------------------------------------
-    # 2. Block-level fields
-    # ------------------------------------------------------------------
-    block_length             = np.full(n_blocks, np.nan)
-    block_rule               = np.full(n_blocks, np.nan)
-    block_trans              = np.full(n_blocks, np.nan)
-    block_trial_to_crit      = np.full(n_blocks, np.nan)
-    block_trial_random_added = np.full(n_blocks, np.nan)
-    reward_rates             = np.full(n_blocks, np.nan)
-    hit_rates                = np.full(n_blocks, np.nan)
-    p_win_stay               = np.full(n_blocks, np.nan)
-    p_lose_switch            = np.full(n_blocks, np.nan)
-    block_pre_switch_better  = np.full(n_blocks, np.nan)
-    block_pre_switch_worse   = np.full(n_blocks, np.nan)
-
-    trans_list = []
-
-    for b in range(n_blocks):
-        t1 = block_start[b]
-        t2 = block_end[b]
-        idx = np.arange(t1, t2)
-
-        rule_blk  = rule[idx]
-        rule_vals = rule_blk[~np.isnan(rule_blk)]
-
-        if len(rule_vals) == 0:
-            continue
-
-        block_length[b] = len(idx)
-
-        # Rule = mode of non-NaN rule values in block
-        block_rule[b] = float(
-            np.bincount(rule_vals.astype(int) - 1).argmax() + 1
-        )
-
-        # High-reward side from first valid trial in block
-        first_valid_abs = t1 + int(np.where(~np.isnan(rule_blk))[0][0])
-        lp = rewardprob[first_valid_abs, 0]
-        rp = rewardprob[first_valid_abs, 1]
-        hr_side_b = -1.0 if lp > rp else 1.0
-
-        # Transition to next block
-        if b < n_blocks - 1:
-            next_t1   = block_start[b + 1]
-            next_t2   = block_end[b + 1]
-            next_vals = rule[next_t1:next_t2]
-            next_vals = next_vals[~np.isnan(next_vals)]
-            if len(next_vals) > 0:
-                next_rule = float(
-                    np.bincount(next_vals.astype(int) - 1).argmax() + 1
-                )
-                block_trans[b] = next_rule
-                trans_list.append([block_rule[b], next_rule])
-
-        # Choices and outcomes within block
-        c_blk  = c[idx]
-        r_blk  = r[idx]
-        valid  = ~np.isnan(c_blk)
-        c_val  = c_blk[valid]
-        r_val  = r_blk[valid]
-
-        if len(c_val) == 0:
-            continue
-
-        # Reward rate
-        reward_rates[b] = np.nanmean(r_blk)
-
-        # Hit rate: fraction of non-miss trials on hr side
-        hit_rates[b] = np.mean(c_val == hr_side_b)
-
-        # Win-stay / lose-switch
-        if len(c_val) > 1:
-            win_idx = np.where(r_val[:-1] == 1)[0]
-            if len(win_idx) > 0:
-                p_win_stay[b] = np.mean(c_val[win_idx + 1] == c_val[win_idx])
-
-            lose_idx = np.where(r_val[:-1] == 0)[0]
-            if len(lose_idx) > 0:
-                p_lose_switch[b] = np.mean(
-                    c_val[lose_idx + 1] != c_val[lose_idx]
-                )
-
-        # Pre-switch choice = last non-NaN choice in block
-        last_valid = np.where(~np.isnan(c_blk))[0]
-        if len(last_valid) > 0:
-            last_choice = c_blk[last_valid[-1]]
-            block_pre_switch_better[b] = float(last_choice == hr_side_b)
-            block_pre_switch_worse[b]  = float(last_choice != hr_side_b)
-
-        # Trials-to-criterion = position (1-indexed) of 10th hr-side choice
-        better_idx = np.where(c_blk == hr_side_b)[0]
-        if len(better_idx) >= 10:
-            block_trial_to_crit[b]      = float(better_idx[9] + 1)
-            block_trial_random_added[b] = max(0.0, block_length[b] - block_trial_to_crit[b])
-        else:
-            # nunca llegó a 10 elecciones buenas → criterio/random indefinidos, excluir
-            block_trial_to_crit[b]      = np.nan
-            block_trial_random_added[b] = np.nan
-
-    # ------------------------------------------------------------------
-    # 3. Trial-level hr_side
+    # hr_side per trial (.m: from rewardprob; NaN where rewardprob is NaN)
     # ------------------------------------------------------------------
     hr_side = np.full(n_trials, np.nan)
-    for b in range(n_blocks):
-        t1       = block_start[b]
-        t2       = block_end[b]
-        rule_blk = rule[t1:t2]
-        if np.all(np.isnan(rule_blk)):
-            continue
-        first_valid_abs = t1 + int(np.where(~np.isnan(rule_blk))[0][0])
-        lp = rewardprob[first_valid_abs, 0]
-        rp = rewardprob[first_valid_abs, 1]
-        hr_side[t1:t2] = -1.0 if lp > rp else 1.0
+    hr_side[rewardprob[:, 0] > rewardprob[:, 1]] = -1.0
+    hr_side[rewardprob[:, 0] < rewardprob[:, 1]] = 1.0
 
     # ------------------------------------------------------------------
-    # 4. ruletransList: unique [from, to] pairs
+    # Run-length encoding: x0(1:end-1) ~= x0(2:end)  (NaN ~= NaN is True)
     # ------------------------------------------------------------------
-    if trans_list:
-        rule_trans_list = np.unique(
-            np.array(trans_list, dtype=float), axis=0
-        )
-    else:
-        rule_trans_list = np.zeros((0, 2), dtype=float)
+    change = np.where(rule[:-1] != rule[1:])[0] + 1          # 0-based starts of new blocks
+    ends = np.concatenate([change, [n_trials]])               # exclusive ends
+    starts = np.concatenate([[0], change])
+    block_length = (ends - starts).astype(float)
+    block_rule = rule[ends - 1]                                # rule at the end of each block
+    n_blocks = len(block_length)
 
-    # ------------------------------------------------------------------
-    # 5. Store — field names match MATLAB exactly
-    # ------------------------------------------------------------------
-    stats["blockLength"]                        = block_length
-    stats["blockRule"]                          = block_rule
-    stats["blockTrans"]                         = block_trans
-    stats["blockTrialtoCrit"]                   = block_trial_to_crit
-    stats["blockTrialRandomAdded"]              = block_trial_random_added
-    stats["blockPreSwitchBetterChoiceAtSwitch"] = block_pre_switch_better
-    stats["blockPreSwitchWorseChoiceAtSwitch"]  = block_pre_switch_worse
-    stats["rewardrates"]                        = reward_rates
-    stats["hitrates"]                           = hit_rates
-    stats["pWinStay"]                           = p_win_stay
-    stats["pLooseSwitch"]                       = p_lose_switch
-    stats["hr_side"]                            = hr_side
-    stats["ruletransList"]                      = rule_trans_list
+    # all possible transitions i != j, in the .m order
+    rule_trans_list = np.array([[i, j] for i in range(1, n_rules + 1)
+                                for j in range(1, n_rules + 1) if i != j], dtype=float)
+    valid_trans = {(a, b) for a, b in rule_trans_list}
 
+    def nan_block():
+        return np.full(n_blocks, np.nan)
+
+    block_trans = nan_block()
+    block_ttc = nan_block()
+    block_random = nan_block()
+    pre_better_rate = nan_block()
+    pre_worse_rate = nan_block()
+    pre_better_at = nan_block()
+    pre_worse_at = nan_block()
+    p_win_stay = nan_block()
+    p_lose_switch = nan_block()
+    hitrates = nan_block()
+    rewardrates = nan_block()
+
+    for i in range(n_blocks - 1):                              # .m: i = 1:numel(blockLength)-1
+        if (block_rule[i], block_rule[i + 1]) not in valid_trans:
+            continue                                           # e.g. transition into a NaN gap
+        s = int(starts[i])                                     # first trial of block (0-based)
+        e = int(ends[i]) - 1                                   # last trial of block (0-based)
+        hr = hr_side[s]
+        block_trans[i] = block_rule[i + 1]
+
+        # trials to criterion: 10th cumulative choice of the high-reward side
+        hits = np.cumsum(_eq(c[s:e + 1], hr))
+        th = np.where(hits == N_CRIT)[0]
+        if len(th):
+            block_ttc[i] = th[0] + 1                            # 1-based position in block
+            block_random[i] = block_length[i] - block_ttc[i]
+
+        # choice rates in the last 5 trials (.m: c(E-4:E); miss counts as 0)
+        w = slice(max(e - (N_PRESWITCH - 1), 0), e + 1)
+        pre_better_rate[i] = np.mean(_eq(c[w], hr))
+        pre_worse_rate[i] = np.mean(_eq(c[w], -hr))
+        # choice at the trial before the switch (.m: c(E))
+        pre_better_at[i] = float(_eq(c[e], hr))
+        pre_worse_at[i] = float(_eq(c[e], -hr))
+
+        # win-stay / lose-switch on the last 6 trials (.m: r(E-5:E-1), diff(c(E-5:E)==hr))
+        lo = max(e - N_WSLS, 0)
+        rew = r[lo:e]
+        stay = np.diff(_eq(c[lo:e + 1], hr).astype(int)) == 0
+        n_win, n_lose = np.nansum(rew == 1), np.nansum(rew == 0)
+        p_win_stay[i] = np.sum((rew == 1) & stay) / n_win if n_win else np.nan
+        p_lose_switch[i] = np.sum((rew == 0) & ~stay) / n_lose if n_lose else np.nan
+
+        # hit / reward rates in PERCENT over blockStart : blockEnd+1 (off-by-one of the .m)
+        rng = slice(s, min(e + 2, n_trials))
+        n_rng = (min(e + 2, n_trials)) - s
+        hitrates[i] = 100.0 * np.sum(_eq(c[rng], hr)) / n_rng
+        rewardrates[i] = 100.0 * np.nansum(r[rng]) / n_rng
+
+    # consistency checks of the .m (it only prints)
+    if np.any(block_ttc[np.isfinite(block_ttc)] < N_CRIT):
+        warnings.warn("value_getTrialStatsMore: fewer than 10 trials to reach criterion?!")
+    if np.any(block_random[np.isfinite(block_random)] < 0):
+        warnings.warn("value_getTrialStatsMore: random number added for block length < 0?!")
+
+    stats["hr_side"] = hr_side
+    stats["blockLength"] = block_length
+    stats["blockRule"] = block_rule
+    stats["ruletransList"] = rule_trans_list
+    stats["blockTrans"] = block_trans
+    stats["blockTrialtoCrit"] = block_ttc
+    stats["blockTrialRandomAdded"] = block_random
+    stats["blockPreSwitchBetterChoiceRate"] = pre_better_rate
+    stats["blockPreSwitchWorseChoiceRate"] = pre_worse_rate
+    stats["blockPreSwitchBetterChoiceAtSwitch"] = pre_better_at
+    stats["blockPreSwitchWorseChoiceAtSwitch"] = pre_worse_at
+    stats["pWinStay"] = p_win_stay
+    stats["pLooseSwitch"] = p_lose_switch
+    stats["hitrates"] = hitrates
+    stats["rewardrates"] = rewardrates
     return stats

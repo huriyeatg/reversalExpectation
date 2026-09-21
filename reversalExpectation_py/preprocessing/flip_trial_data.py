@@ -43,7 +43,10 @@ def flip_trial_data(trial_data: dict) -> dict:
 
     stim, resp, outcome, rule_codes, event = get_presentation_codes(phase)
 
-    new = {k: (v.copy() if isinstance(v, np.ndarray) else list(v))
+    # copy every field; list() only for real sequences (the previous version
+    # called list() on the scalar presCodeSet and always raised TypeError)
+    new = {k: (v.copy() if isinstance(v, np.ndarray)
+               else list(v) if isinstance(v, (list, tuple)) else v)
            for k, v in trial_data.items()}
 
     # --- Swap lick times ---

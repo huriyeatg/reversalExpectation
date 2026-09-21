@@ -80,6 +80,13 @@ NUM_SWITCH_CRITERION = 3     # min rule switches: keep sessions with switch_num 
                              # i.e. >= 4 block switches. Matches Murphy et al. 2024
                              # ("excluded the session if the animal had fewer than 4
                              # block switches", Methods)
+#
+# DELIBERATE DIVERGENCE FROM THE .m (project decision): determineBehCriteria.m
+# uses numSwitch = 2 (switchNum > 2, i.e. >= 3 switches). We follow the published
+# Methods text instead. Consequence for the naive dataset: 594 sessions pass
+# (vs 616 with the .m rule; the 22 sessions lost have exactly 3 switches).
+# NOTE: bandit_R71_lesion.csv files generated before the stats fix were built
+# with the .m rule (616 sessions); analyses run on them must be redone.
 
 
 def compute_session_criteria(df: pd.DataFrame) -> pd.DataFrame:

@@ -50,7 +50,7 @@ N_CATEGORIES = 2
 OBS_DIM = 1
 
 # defaults (override from caller / master_bandit.py)
-PARAMETRIZATION = "reward_perseveration"
+PARAMETRIZATION = "ashwood_wsls"
 N_LAGS = 3
 K_RANGE = (1, 2, 3, 4, 5)
 N_RESTARTS = 15

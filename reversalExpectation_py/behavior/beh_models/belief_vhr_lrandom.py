@@ -55,7 +55,8 @@ def select_naive_meets_criteria(df: pd.DataFrame, verbose: bool = True) -> pd.Da
     """Reproduce the GLM-HMM inclusion filter WITHOUT importing hmmGlm (which
     pulls in ssm, absent from the revExp env): naive (lesioned is NaN), all
     phases unified, meets_criteria == True. Keeps the belief_vhr test
-    apples-to-apples with the GLM-HMM (same 616-session set)."""
+    apples-to-apples with the GLM-HMM (same session set: 594 naive
+    sessions with >= 4 switches, see lesion_index.NUM_SWITCH_CRITERION)."""
     out = df[df["lesioned"].isna()]
     out = out[out["meets_criteria"] == True].copy()
     if verbose:

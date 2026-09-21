@@ -1,10 +1,17 @@
-numpy
-pandas
-scipy
-matplotlib
-scikit-learn
-joblib
-pybads        # BADS optimizer for the belief models (optimizer="lbfgs" falls back to scipy)
-statsmodels   # optional: GEE stats in alternation_after_correct_figure
-# GLM-HMM (run_glmhmm.py) additionally needs the zashwood/ssm fork, installed in a
-# separate `ssm` conda env: pip install git+https://github.com/zashwood/ssm.git
+# ===========================================================================
+# Main analysis environment (Python 3.12)
+# Everything except the GLM-HMM fit: preprocessing, behavior, belief models,
+# neuromodulator pipeline (Wang et al. 2025), exploratory analyses.
+# ===========================================================================
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+matplotlib>=3.8
+scikit-learn>=1.3      # logistic_regression.py, session_profiles.py, glmhmm_kselection.py
+joblib>=1.3            # parallel fits (belief_vhr_lrandom, hmmGlm)
+statsmodels>=0.14      # GEE in directed_switch / alternation_after_correct (optional)
+pybads>=1.0            # BADS optimizer for the belief models (falls back to L-BFGS-B)
+
+# GLM-HMM (run_glmhmm.py, glmhmm_decode.py, glmhmm_heldout_validation.py) needs the
+# zashwood/ssm fork, which requires numpy < 2 -> separate environment:
+# see requirements-ssm.txt
