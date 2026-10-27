@@ -44,6 +44,14 @@ DIVERGENCES paper vs. code (parameters below):
   - Percentile: MATLAB prctile interpolates differently than numpy;
     numerically negligible difference in F0                  (documented, not parametrized)
 
+PREPARATION: Wang et al. recorded medial M2 (secondary motor cortex) with
+two-photon imaging and a 28x28 ROI grid, in mice playing matching pennies.
+THIS dataset is PRELIMBIC cortex, 1-photon miniscope, ONE ROI per session
+(data/ReadMe_DataCollectionForBanditTask.txt; master_banditneuromodulator.m),
+in a reversal bandit. The analysis scheme below transfers; the region,
+the spatial resolution and the task do not, so Wang's region-specific results
+are a reference, not a prediction for this dataset.
+
 Deliberately NOT replicated (does not apply to this dataset):
   - 28x28 ROI grid over the 2P FOV (here each trace column of the CSV = 1 unit)
   - End-of-session cut by 3-choice entropy < 1 [cutoff.m]: in a reversal

@@ -4,6 +4,9 @@ run_wang2025_neuromodulator.py
 Applies the Wang et al. 2025 pipeline (wang2025_pipeline.py) to every session
 of the miniscope dataset and summarizes NE vs ACh.
 
+Recording site: PRELIMBIC cortex, 1-photon miniscope, one ROI per session
+(not M2 / two-photon as in Wang et al.; see wang2025_pipeline.py, PREPARATION).
+
 Per session:
   1. Behavior with the same loader as per_session.py
      (parse_logfile -> get_session_data -> get_trial_masks).

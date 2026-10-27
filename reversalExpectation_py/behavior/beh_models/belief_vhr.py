@@ -368,3 +368,56 @@ def simulate_belief_vhr(c_real, r_real, rule, tau, a: float, b: float, beta: flo
             bel = _belief_update(_transition(bel, H_step), ct, rt, p_high, p_low)
 
     return {"c_sim": c_sim, "belief": belief, "p_left": p_left, "hazard": hazard}
+
+def belief_trajectory(params, c, r, n_rules: int = 2, tau=None) -> dict:
+    """
+    Latent trajectory of the fitted belief_vhr model on REAL choices/outcomes.
+
+    Same recurrence as belief_vhr_trial_loglikes (Murphy order: decide on the
+    carried belief, then transition + Bayes at the end of the trial), but it
+    returns the latents instead of the likelihood, for use as neural regressors.
+
+    Returns dict of (n_trials,) arrays, all defined at DECISION TIME of trial t
+    (they depend only on trials < t, so they are causal):
+        belief      : P(rule = left-better) carried into the trial
+        confidence  : |2*belief - 1|, 0 = maximal uncertainty, 1 = certain
+        hazard      : H = sigmoid(a + b*tau) governing the step into t+1
+        p_left      : choice probability predicted by the model
+        p_chosen    : predicted probability of the choice the animal made
+        surprise    : -log p_chosen, the model's surprise at the actual choice
+        rpe         : reward prediction error r - E[r | belief, chosen side]
+    """
+    a, b, beta = params
+    p_high, p_low = _reward_probs_for_n_rules(n_rules)
+    c = np.asarray(c, float)
+    r = np.asarray(r, float)
+    tau = np.zeros(len(c)) if tau is None else np.asarray(tau, float)
+    n = len(c)
+
+    out = {k: np.full(n, np.nan) for k in
+           ("belief", "confidence", "hazard", "p_left", "p_chosen", "surprise", "rpe")}
+    belief = 0.5
+    for t in range(n):
+        p_l = expit(beta * _q_diff(belief, p_high, p_low))
+        out["belief"][t] = belief
+        out["confidence"][t] = abs(2.0 * belief - 1.0)
+        out["p_left"][t] = p_l
+
+        ct = c[t]
+        if not np.isnan(ct):
+            p_chosen = p_l if ct == -1 else (1.0 - p_l)
+            out["p_chosen"][t] = p_chosen
+            out["surprise"][t] = -np.log(np.clip(p_chosen, 1e-15, 1.0))
+            # expected reward on the chosen side under the current belief:
+            # left is the high-probability side with probability `belief`
+            if ct == -1:
+                exp_r = belief * p_high + (1.0 - belief) * p_low
+            else:
+                exp_r = belief * p_low + (1.0 - belief) * p_high
+            out["rpe"][t] = r[t] - exp_r
+
+        tau_step = tau[t + 1] if (t + 1) < n else tau[t]
+        H_step = expit(a + b * tau_step)
+        out["hazard"][t] = H_step
+        belief = _belief_update(_transition(belief, H_step), ct, r[t], p_high, p_low)
+    return out

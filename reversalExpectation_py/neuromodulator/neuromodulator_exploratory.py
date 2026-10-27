@@ -4,6 +4,8 @@ neuromodulator_exploratory.py
 General exploratory analysis of the neuromodulator (imaging) sessions that is
 also a NEURAL test of the session / trial matching.
 
+Recording site: PRELIMBIC cortex, 1-photon miniscope, one ROI per session.
+
 Per session (phase 31, with trace + timeEvents):
   1. QC: sampling rate, duration, raw F level, bleaching, n trial stamps vs
      n log trials, whether the trace looks like raw fluorescence.

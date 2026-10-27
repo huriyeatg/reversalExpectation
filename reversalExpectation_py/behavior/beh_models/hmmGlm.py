@@ -37,6 +37,8 @@ Model selection uses session-level cross-validation on held-out per-trial
 log-likelihood (not BIC). Missed trials are masked, never dropped.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
@@ -50,7 +52,7 @@ N_CATEGORIES = 2
 OBS_DIM = 1
 
 # defaults (override from caller / master_bandit.py)
-PARAMETRIZATION = "ashwood_wsls"
+PARAMETRIZATION = "reward_perseveration"
 N_LAGS = 3
 K_RANGE = (1, 2, 3, 4, 5)
 N_RESTARTS = 15
@@ -507,19 +509,35 @@ def cross_validate_glmhmm(df: pd.DataFrame, K_range=K_RANGE, n_lags: int = N_LAG
                           n_folds: int = CV_N_FOLDS, n_restarts: int = N_RESTARTS,
                           n_iters: int = N_ITERS, tolerance: float = TOLERANCE,
                           seed: int = 0, n_jobs: int = CV_N_JOBS,
-                          hierarchical: bool = True) -> pd.DataFrame:
+                          hierarchical: bool = True,
+                          checkpoint: str = None) -> pd.DataFrame:
     """Session-level CV of held-out per-trial log-likelihood across K.
 
     With hierarchical=True, each training fit follows the Ashwood recipe
     (GLM -> global GLM-HMM init). Returns tidy DataFrame [K, fold, test_ll_per_trial].
+
+    checkpoint : path of a CSV written after EVERY (fold, K) fit. On a new call
+        with the same path, the (fold, K) pairs already in the file are skipped,
+        so an interrupted run resumes instead of starting over. Each fit takes
+        hours on the full dataset, so use it for any full run. Delete the file
+        to force a clean CV.
     """
     choices, inputs, masks, tags = build_glmhmm_inputs(df, n_lags=n_lags,
                                                        parametrization=parametrization)
     n_ses = len(choices)
     folds = _session_folds([t[0] for t in tags], n_folds, seed)   # stratified by animal
-    rows = []
+
+    rows, done = [], set()
+    if checkpoint is not None and Path(checkpoint).exists():
+        prev = pd.read_csv(checkpoint)
+        rows = prev.to_dict("records")
+        done = {(int(r["fold"]), int(r["K"])) for r in rows}
+        print(f"[CV] resuming from {checkpoint}: {len(done)} of "
+              f"{len(folds) * len(K_range)} (fold, K) fits already done")
 
     for f, te in enumerate(folds):
+        if all((f, K) in done for K in K_range):
+            continue                      # whole fold already done: skip its GLM too
         te = list(te)
         tr = [i for i in range(n_ses) if i not in set(te)]
         tr_ch, tr_in, tr_mk = _split(choices, tr), _split(inputs, tr), _split(masks, tr)
@@ -531,7 +549,9 @@ def cross_validate_glmhmm(df: pd.DataFrame, K_range=K_RANGE, n_lags: int = N_LAG
             _, glm_w = fit_glm(tr_ch, tr_in, tr_mk, seed=seed + f, n_jobs=n_jobs)
 
         for K in K_range:
-            if hierarchical and K > 1:
+            if (f, K) in done:
+                continue                  # already in the checkpoint
+            if hierarchical and K > 1:    # Ashwood: global fit initialised from the GLM
                 model = fit_global_glmhmm(tr_ch, tr_in, tr_mk, K, glm_w,
                                           n_restarts=n_restarts, n_iters=n_iters,
                                           tolerance=tolerance, seed=seed + f, n_jobs=n_jobs)
@@ -541,9 +561,14 @@ def cross_validate_glmhmm(df: pd.DataFrame, K_range=K_RANGE, n_lags: int = N_LAG
                                    seed=seed + f, n_jobs=n_jobs)
             test_ll = model.log_likelihood(te_ch, inputs=te_in, masks=te_mk)
             rows.append({"K": K, "fold": f, "test_ll_per_trial": test_ll / n_te})
-            print(f"[CV] fold {f}  K={K}  held-out LL/trial = {test_ll / n_te:.4f}")
+            print(f"[CV] fold {f}  K={K}  held-out LL/trial = {test_ll / n_te:.4f}",
+                  flush=True)
+            if checkpoint is not None:     # save after every fit, not at the end
+                Path(checkpoint).parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(rows).to_csv(checkpoint, index=False)
 
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows).sort_values(["fold", "K"]).reset_index(drop=True)
+    return out
 
 
 def model_comparison(df: pd.DataFrame, K_states: int, n_lags: int = N_LAGS,

@@ -87,11 +87,11 @@ N_ITERS     = 200
 N_FOLDS     = 5
 N_JOBS      = -1             # parallel workers for CV / comparison / final fit (n_jobs=-1 uses all cores)
 
-RUN_CV           = False     # cross-validate held-out LL across K
-RUN_COMPARISON   = False     # GLM vs lapse vs GLM-HMM(CHOSEN_K)
+RUN_CV           = True     # cross-validate held-out LL across K
+RUN_COMPARISON   = True     # GLM vs lapse vs GLM-HMM(CHOSEN_K)
 RUN_KSELECTION   = False     # slide figures: CV curve + state-stability
 RUN_ANTICIPATION = False     # anticipation test (P(worse|tau) in L_Random)
-RUN_STATE_OCCUPANCY = True  # state occupancy: block-end aligned + within-session
+RUN_STATE_OCCUPANCY = False  # state occupancy: block-end aligned + within-session
 RUN_PER_SESSION_OCCUPANCY = False  # one figure per session (~594 files); slow, off by default
 
 # FORCE_REFIT: if True, always re-fit the GLM-HMM and OVERWRITE glmhmm_states.csv,
@@ -186,9 +186,12 @@ def main():
     if RUN_CV:
         print("\n=== Cross-validation over K ===")
         t0 = time.time()
+        # checkpoint: one row saved per (fold, K) fit, so an interrupted CV
+        # resumes instead of restarting. Delete the file to force a clean CV.
         cv = g.cross_validate_glmhmm(df, K_range=K_RANGE, parametrization=PARAMETRIZATION,
                                      n_folds=N_FOLDS, n_restarts=N_RESTARTS,
-                                     n_iters=N_ITERS, n_jobs=N_JOBS)
+                                     n_iters=N_ITERS, n_jobs=N_JOBS,
+                                     checkpoint=str(OUTPUT_DIR / "glmhmm_cv_checkpoint.csv"))
         cv.to_csv(OUTPUT_DIR / "glmhmm_cv.csv", index=False)
         print(f"\nCV done in {time.time()-t0:.0f}s. Mean held-out LL/trial by K:")
         print(cv.groupby("K")["test_ll_per_trial"].mean().round(4).to_string())

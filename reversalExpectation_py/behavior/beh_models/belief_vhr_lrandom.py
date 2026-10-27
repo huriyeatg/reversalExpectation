@@ -25,7 +25,12 @@ Run from the revExp environment (belief_vhr / bayesian_models must import).
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+# make the repo root importable so `behavior.beh_models...` resolves when this
+# file is run by path (python behavior\beh_models\belief_vhr_lrandom.py)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import numpy as np
 import pandas as pd
@@ -195,7 +200,13 @@ def plot_vhr_lrandom(df, global_res, per_animal_df, max_tau: int = 20,
     H_fit = expit(global_res["a"] + global_res["b"] * taus)
     H_const = expit(global_res["a0"]) * np.ones_like(taus, float)
     try:
-        haz, p_hat = empirical_hazard(df, max_lrandom=max_tau)
+        # The cutoff must be well beyond the plotted range: empirical_hazard drops
+        # blocks with L_Random > max_lrandom, so passing max_tau here truncates the
+        # risk set and forces H -> 1 at tau = max_tau (a pure artifact: with a
+        # cutoff of 20, H(18) = 0.36; with 30 or more, H(18) = 0.12). 9% of blocks
+        # have L_Random > 20 and they are what keeps the tail honest.
+        haz, p_hat = empirical_hazard(df, max_lrandom=max(60, 3 * max_tau))
+        haz = haz[haz["tau"] <= max_tau]
         solid = haz["n_at_risk"].to_numpy() >= 20
         ax.errorbar(haz.loc[solid, "tau"], haz.loc[solid, "hazard"],
                     yerr=haz.loc[solid, "se"], fmt="o", color=GOLD, ms=4, lw=1.4,
@@ -258,6 +269,13 @@ def run_vhr_lrandom_test(df, output_dir="analysis", figs_dir="figs", n_restarts_
           f"LR={global_res['LR']:.1f}  p={global_res['p_boundary']:.3g}  "
           f"dBIC={global_res['dBIC']:+.1f}  dLL/trial={global_res['dLL_per_trial']:+.4f}  "
           f"(n={global_res['n_scored']})")
+    # the hazard is what the result means; the LL gain per trial is tiny by
+    # construction, so report H(tau) at a few tau alongside the slope
+    H0 = expit(global_res["a"])
+    print(f"[vhr_lrandom] inferred hazard: H(0)={H0:.3f}  H(5)={expit(global_res['a'] + 5*global_res['b']):.3f}  "
+          f"H(10)={expit(global_res['a'] + 10*global_res['b']):.3f}  "
+          f"H(20)={expit(global_res['a'] + 20*global_res['b']):.3f}  "
+          f"(constant-hazard model: H={expit(global_res['a0']):.3f})")
     pa, summary = per_animal_test(df, n_restarts=n_restarts_animal, n_jobs=n_jobs)
     print(f"[vhr_lrandom] PER ANIMAL: median b={summary['median_b']:.3f}, "
           f"{summary['frac_b_pos']*100:.0f}% > 0, "
@@ -265,6 +283,9 @@ def run_vhr_lrandom_test(df, output_dir="analysis", figs_dir="figs", n_restarts_
     out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
     figs = Path(figs_dir); figs.mkdir(parents=True, exist_ok=True)
     pa.to_csv(out / "belief_vhr_lrandom_per_animal.csv", index=False)
+    # the global fit was only printed before: save it too (a, b, beta, LR, dBIC...)
+    pd.DataFrame([{**global_res, **{f"summary_{k}": v for k, v in summary.items()}}]).to_csv(
+        out / "belief_vhr_lrandom_global.csv", index=False)
     fig = plot_vhr_lrandom(df, global_res, pa, outfile=str(figs / "belief_vhr_lrandom.png"))
     print(f"[vhr_lrandom] wrote {fig}")
     return global_res, pa, summary

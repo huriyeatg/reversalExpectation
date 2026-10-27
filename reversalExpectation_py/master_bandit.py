@@ -200,7 +200,9 @@ if __name__ == "__main__":
     # Also restrict to sessions that meet the performance criterion. This is the
     # extra filter the GLM-HMM and the anticipation test already apply; turning it
     # on here makes the models and the figures use the SAME inclusion set
-    # ("naive" + meets_criteria == the canonical 341,972-trial / 616-session set).
+    # ("naive" + meets_criteria == the canonical 336,628-trial / 594-session,
+    # 31-animal set, with switch_num > 3 as in Murphy et al.; the .m rule
+    # (switch_num > 2) gave 616 sessions -- see preprocessing/lesion_index.py).
     # Set False to keep every session of the chosen lesion group.
     MEETS_CRITERIA_ONLY = True
 
