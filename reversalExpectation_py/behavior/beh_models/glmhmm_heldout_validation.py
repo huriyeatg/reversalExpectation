@@ -23,10 +23,12 @@ task (rules 41/42, 70:10). The model is frozen (no refitting).
     (responded trials > 100 and switches > 3) is applied, and basic behavioral
     metrics are printed next to the training dataset's for comparison.
 
-Requires analysis/glmhmm_model_ashwood_wsls_K2.pkl (run_glmhmm.py with the
-model-saving patch). Run from behavior/beh_models/ in the `ssm` env:
-    conda activate ssm
-    python glmhmm_heldout_validation.py
+Model: the PRIMARY specification (ashwood_wsls, K = 2, prior sigma = 1) and
+its 1-state GLM, frozen, from analysis/glmhmm_primary_K2_sigma1.json
+(glmhmm_fit_primary.py). Numpy only, no ssm.
+
+Run from reversalExpectation_py/ (revExp env):
+    python behavior/beh_models/glmhmm_heldout_validation.py
 """
 
 import importlib.util
@@ -41,7 +43,6 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(REPO_ROOT))
-import hmmGlm as g  # noqa: E402
 
 
 def _load(path: Path, name: str):
@@ -55,7 +56,7 @@ dec = _load(HERE / "glmhmm_decode.py", "glmhmm_decode")
 NM = REPO_ROOT / "neuromodulator"
 ntr = _load(NM / "neuromodulator_trials.py", "neuromodulator_trials")
 
-MODEL_PKL = REPO_ROOT / "analysis" / "glmhmm_model_ashwood_wsls_K2.pkl"
+MODEL_JSON = REPO_ROOT / "analysis" / "glmhmm_primary_K2_sigma1.json"
 TRAIN_CSV = REPO_ROOT / "analysis" / "bandit_R71_lesion.csv"
 OUT_DIR = REPO_ROOT / "analysis" / "glmhmm_heldout"
 PHASES = [31]
@@ -66,13 +67,9 @@ COHORT = {1.0: "NE", 2.0: "ACh"}
 
 
 # ---------------------------------------------------------------------------
-def session_loglik(model, df_ses, bundle):
-    ch, X, mk = g.build_session_arrays(df_ses[["choice", "rewarded"]],
-                                       n_lags=bundle["n_lags"],
-                                       parametrization=bundle["parametrization"])
-    n_obs = int(mk.sum())
-    ll = float(model.log_likelihood([ch], inputs=[X], masks=[mk]))
-    return ll, n_obs
+def session_loglik(model, df_ses):
+    """(ll_glmhmm, ll_glm, n_obs) of one session under the frozen models."""
+    return dec.session_loglik(model, df_ses["choice"].to_numpy(), df_ses["rewarded"].to_numpy())
 
 
 def paired(a, b):
@@ -112,15 +109,15 @@ def load_sessions():
 
 
 # ---------------------------------------------------------------------------
-def part_a(bundle, tables):
+def part_a(model, tables):
     rows = []
     for d in tables:
-        ll_h, n = session_loglik(bundle["model"], d, bundle)
+        ll_h, ll_g, n = session_loglik(model, d)
         row = {"animal": d["animal"].iloc[0], "cohort": d["cohort"].iloc[0],
                "session": d["session_file"].iloc[0], "n_obs": n,
                "ll_glmhmm": ll_h / n, "ll_chance": np.log(0.5)}
-        if bundle.get("glm_model") is not None:
-            row["ll_glm"] = session_loglik(bundle["glm_model"], d, bundle)[0] / n
+        if np.isfinite(ll_g):
+            row["ll_glm"] = ll_g / n
         rows.append(row)
     ses = pd.DataFrame(rows)
     # per-animal means weighted by trials
@@ -130,12 +127,13 @@ def part_a(bundle, tables):
     return ses, ani
 
 
-def decode_all(bundle, tables):
+def decode_all(model, tables):
     out = []
     for d in tables:
-        s = dec.decode_session(bundle, d["choice"].to_numpy(), d["rewarded"].to_numpy())
+        s = dec.decode_session(model, d["choice"].to_numpy(), d["rewarded"].to_numpy())
         out.append(pd.concat([d.reset_index(drop=True),
-                              s[["glmhmm_state", "is_exploit", "p_engaged", "p_engaged_filtered"]]], axis=1))
+                              s[["glmhmm_state", "is_exploit", "p_engaged", "p_engaged_filtered",
+                                 "p_engaged_predicted"]]], axis=1))
     return pd.concat(out, ignore_index=True)
 
 
@@ -226,10 +224,8 @@ def figure(ani, res, out):
 
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    bundle = dec.load_model(MODEL_PKL)
-    if bundle.get("glm_model") is None:
-        print("NOTE: the pickle has no 1-state GLM (re-run run_glmhmm.py with the "
-              "patch); comparison vs GLM will be skipped.")
+    model = dec.load_model(MODEL_JSON)
+    print(f"model: {MODEL_JSON.name} (K={model['K']}, sigma={model['prior_sigma']})")
 
     tables, meta = load_sessions()
     meta.to_csv(OUT_DIR / "sessions.csv", index=False)
@@ -240,7 +236,7 @@ def main():
     print("\n=== (C) Comparability with the training dataset (session medians) ===")
     print(training_comparison(meta[meta.status == "ok"], tables).to_string())
 
-    ses, ani = part_a(bundle, tables)
+    ses, ani = part_a(model, tables)
     ses.to_csv(OUT_DIR / "loglik_per_session.csv", index=False)
     ani.to_csv(OUT_DIR / "loglik_per_animal.csv", index=False)
     print("\n=== (A) Held-out log-likelihood per trial (animal means) ===")
@@ -252,7 +248,7 @@ def main():
     t = paired(ani["ll_glmhmm"], ani["ll_chance"])
     print(f"GLM-HMM vs chance: median gain {t['median_diff']:+.4f} nats/trial, p={t['p']:.3g}")
 
-    df = decode_all(bundle, tables)
+    df = decode_all(model, tables)
     df.to_csv(OUT_DIR / "decoded_states.csv", index=False)
     print(f"\nExploit occupancy (median across animals): "
           f"{df.groupby('animal')['is_exploit'].mean().median():.3f}")

@@ -5,79 +5,135 @@ Decode GLM-HMM states on NEW sessions with the frozen global model.
 
 The neuromodulator imaging sessions (phase 31/32) are not part of the
 behavioral dataset the global GLM-HMM was fit on. Re-fitting on them would
-change what "exploit" and "explore" mean; instead, the states are INFERRED on
-these sessions with the global parameters held fixed (weights, transition
-matrix, initial distribution), so a state label means the same thing as in the
+change what the states mean; instead, the states are INFERRED on these
+sessions with the global parameters held fixed (weights, transition matrix,
+initial distribution), so a state label means the same thing as in the
 behavioral validation.
 
-Requires the pickle written by run_glmhmm.py after the final fit:
-    analysis/glmhmm_model_<parametrization>_K<K>.pkl
+Model: the PRIMARY specification (ashwood_wsls, K = 2, prior sigma = 1), read
+from the JSON written by glmhmm_fit_primary.py:
+    analysis/glmhmm_primary_K2_sigma1.json
+Numpy only (no ssm, no pickle). The design matrix is built exactly as for the
+fit (glmhmm_regularization.session_design == hmmGlm.build_session_arrays,
+ashwood_wsls branch).
 
-Two posteriors are returned per trial:
-    p_engaged          : SMOOTHED posterior (forward-backward, uses the whole
-                         session). Same quantity as glmhmm_states_K2.csv.
-    p_engaged_filtered : FILTERED posterior (forward pass only, uses trials
-                         <= t). Causal: prefer it when relating the state at
-                         trial t to neural activity at or before trial t, since
-                         the smoothed posterior already "knows" choices t+1, t+2...
+Three posteriors of the engaged state are returned per trial t:
+    p_engaged_predicted : ONE-STEP-AHEAD PREDICTED  P(z_t | y_1..t-1)
+                          = filtered(t-1) @ P, and pi0 on the first trial.
+                          Uses only choices/outcomes BEFORE trial t, i.e. what
+                          is known at cue onset of trial t. Use it for any
+                          pre-cue neural window.
+    p_engaged_filtered  : FILTERED  P(z_t | y_1..t). Includes the choice on
+                          trial t itself, so it is NOT pre-cue.
+    p_engaged           : SMOOTHED  P(z_t | y_1..T). Uses the whole session
+                          (future choices too); for description only.
+On a missed trial nothing is observed, so filtered(t) = predicted(t).
 
-Run from behavior/beh_models/ in the `ssm` env:
-    conda activate ssm
-    python glmhmm_decode.py
+Inputs (relative to reversalExpectation_py/):
+    analysis/glmhmm_primary_K2_sigma1.json
+    behaviour files of the neuromodulator sessions (master_neuromodulator index)
+Output:
+    analysis/glmhmm_states_neuromodulator_K2.csv
+
+Run from reversalExpectation_py/ (revExp env, no ssm needed):
+    python behavior/beh_models/glmhmm_decode.py
 """
 
+from __future__ import annotations
+
 import importlib.util
-import pickle
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.special import expit
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(REPO_ROOT))
-import hmmGlm as g  # noqa: E402
+import glmhmm_regularization as gr  # noqa: E402
 
-MODEL_PKL = REPO_ROOT / "analysis" / "glmhmm_model_ashwood_wsls_K2.pkl"
+MODEL_JSON = REPO_ROOT / "analysis" / "glmhmm_primary_K2_sigma1.json"
 OUT_CSV = REPO_ROOT / "analysis" / "glmhmm_states_neuromodulator_K2.csv"
 PHASES = [31]
 
 
-def load_model(path: Path = MODEL_PKL) -> dict:
-    """Load the bundle written by run_glmhmm.py."""
-    with open(path, "rb") as fh:
-        bundle = pickle.load(fh)
-    for key in ("model", "parametrization", "n_lags", "engaged_idx"):
-        if key not in bundle:
-            raise KeyError(f"{path.name} has no '{key}' -- re-run run_glmhmm.py")
-    return bundle
+def load_model(path: Path = MODEL_JSON) -> dict:
+    """Load the frozen primary model written by glmhmm_fit_primary.py."""
+    m = json.loads(Path(path).read_text(encoding="utf-8"))
+    if m["parametrization"] != "ashwood_wsls":
+        raise ValueError(f"decoder only supports ashwood_wsls, got {m['parametrization']}")
+    return {"W": np.asarray(m["W_logodds_right"], float),
+            "w_glm": np.asarray(m["glm_w_logodds_right"], float)
+            if "glm_w_logodds_right" in m else None,
+            "P": np.asarray(m["transition_matrix"], float),
+            "pi0": np.asarray(m["pi0"], float),
+            "engaged_idx": int(m["engaged_idx"]),
+            "K": int(m["K"]), "prior_sigma": float(m["prior_sigma"])}
 
 
-def _filtered_posterior(model, choices, inputs, mask) -> np.ndarray:
-    """Forward-only posterior P(z_t | y_1..t). Uses ssm's filter() when
-    available, otherwise an explicit forward pass with the model's own terms."""
-    if hasattr(model, "filter"):
-        try:
-            return np.asarray(model.filter(choices, input=inputs, mask=mask))
-        except TypeError:
-            pass
-    pi0 = model.init_state_distn.initial_state_distn
-    Ps = model.transitions.transition_matrices(choices, inputs, mask, None)
-    log_lik = model.observations.log_likelihoods(choices, inputs, mask, None)
-    T, K = log_lik.shape
-    alpha = np.zeros((T, K))
-    a = pi0 * np.exp(log_lik[0] - log_lik[0].max())
-    alpha[0] = a / a.sum()
-    for t in range(1, T):
-        P = Ps[t - 1] if Ps.ndim == 3 else Ps
-        a = (alpha[t - 1] @ P) * np.exp(log_lik[t] - log_lik[t].max())
-        alpha[t] = a / a.sum()
-    return alpha
+def posteriors(model: dict, y: np.ndarray, observed: np.ndarray, X: np.ndarray):
+    """Predicted, filtered and smoothed state posteriors of one session.
+
+    y        : (T,) 1 = right, 0 = left (ignored where not observed)
+    observed : (T,) bool, trial with a response
+    X        : (T, 3) design [bias, prev_choice, wsls]
+    Returns three (T, K) arrays: predicted, filtered, smoothed.
+    """
+    W, P, pi0 = model["W"], model["P"], model["pi0"]
+    T, K = len(y), len(pi0)
+    p_right = expit(X @ W.T)                                   # (T, K)
+    lik = np.where(y[:, None] == 1, p_right, 1.0 - p_right)
+    lik[~observed] = 1.0                                       # a miss carries no evidence
+
+    pred = np.empty((T, K))
+    filt = np.empty((T, K))
+    prior = pi0.copy()
+    for t in range(T):
+        pred[t] = prior                                        # P(z_t | y_<t)
+        a = prior * lik[t]
+        filt[t] = a / a.sum()                                  # P(z_t | y_<=t)
+        prior = filt[t] @ P
+
+    # backward pass for the smoothed posterior (scaled by the filter normalisers)
+    beta = np.ones(K)
+    smooth = np.empty((T, K))
+    smooth[-1] = filt[-1]
+    for t in range(T - 2, -1, -1):
+        beta = P @ (lik[t + 1] * beta)
+        beta /= beta.sum()
+        s = filt[t] * beta
+        smooth[t] = s / s.sum()
+    return pred, filt, smooth
 
 
-def decode_session(bundle: dict, choice: np.ndarray, rewarded: np.ndarray) -> pd.DataFrame:
+def session_loglik(model: dict, choice: np.ndarray, rewarded: np.ndarray):
+    """Log-likelihood of one session under the frozen GLM-HMM and, if saved, the
+    1-state GLM (same prior). Returns (ll_glmhmm, ll_glm or NaN, n_observed)."""
+    df_ses = pd.DataFrame({"choice": np.asarray(choice, float),
+                           "rewarded": np.asarray(rewarded, float)})
+    y, obs, X = gr.session_design(df_ses)
+    W, P = model["W"], model["P"]
+    p_right = expit(X @ W.T)
+    lik = np.where(y[:, None] == 1, p_right, 1.0 - p_right)
+    lik[~obs] = 1.0
+    ll, prior = 0.0, model["pi0"].copy()
+    for t in range(len(y)):
+        a = prior * lik[t]
+        s = a.sum()
+        ll += np.log(s)
+        prior = (a / s) @ P
+    ll_glm = np.nan
+    if model.get("w_glm") is not None:
+        q = expit(X @ model["w_glm"])
+        ll_glm = float(np.sum(np.where(y == 1, np.log(q), np.log1p(-q))[obs]))
+    return float(ll), ll_glm, int(obs.sum())
+
+
+def decode_session(model: dict, choice: np.ndarray, rewarded: np.ndarray) -> pd.DataFrame:
     """Decode one session.
 
     choice   : -1 left / +1 right / NaN miss (same coding as the behavioral CSV)
@@ -86,26 +142,25 @@ def decode_session(bundle: dict, choice: np.ndarray, rewarded: np.ndarray) -> pd
     """
     df_ses = pd.DataFrame({"choice": np.asarray(choice, float),
                            "rewarded": np.asarray(rewarded, float)})
-    ch, X, mk = g.build_session_arrays(df_ses, n_lags=bundle["n_lags"],
-                                       parametrization=bundle["parametrization"])
-    model, e = bundle["model"], bundle["engaged_idx"]
-    post = np.asarray(model.expected_states(ch, input=X, mask=mk)[0])
-    filt = _filtered_posterior(model, ch, X, mk)
+    y, obs, X = gr.session_design(df_ses)
+    pred, filt, smooth = posteriors(model, y, obs, X)
+    e = model["engaged_idx"]
     return pd.DataFrame({
         "trial_idx": np.arange(len(df_ses)),
-        "glmhmm_state": post.argmax(1),
-        "is_exploit": (post.argmax(1) == e).astype(int),
-        "p_engaged": post[:, e],
+        "glmhmm_state": smooth.argmax(1),
+        "is_exploit": (smooth.argmax(1) == e).astype(int),
+        "p_engaged": smooth[:, e],
         "p_engaged_filtered": filt[:, e],
+        "p_engaged_predicted": pred[:, e],
     })
 
 
-def decode_trial_table(bundle: dict, df: pd.DataFrame) -> pd.DataFrame:
+def decode_trial_table(model: dict, df: pd.DataFrame) -> pd.DataFrame:
     """Decode every session in a trial table with columns
     animal, session_file, choice, rewarded (trials in session order)."""
     out = []
     for (animal, ses), d in df.groupby(["animal", "session_file"], sort=False):
-        dec = decode_session(bundle, d["choice"].to_numpy(), d["rewarded"].to_numpy())
+        dec = decode_session(model, d["choice"].to_numpy(), d["rewarded"].to_numpy())
         dec.insert(0, "session_file", ses)
         dec.insert(0, "animal", animal)
         out.append(dec)
@@ -120,9 +175,9 @@ def _load_sibling(folder: Path, name: str):
 
 
 def main():
-    bundle = load_model()
-    print(f"loaded {MODEL_PKL.name}: K={bundle['K']}, {bundle['parametrization']}, "
-          f"engaged_idx={bundle['engaged_idx']}")
+    model = load_model()
+    print(f"loaded {MODEL_JSON.name}: K={model['K']}, sigma={model['prior_sigma']}, "
+          f"engaged_idx={model['engaged_idx']}")
 
     # Same session index and behavior loader as the Wang pipeline
     nm = REPO_ROOT / "neuromodulator"
@@ -138,9 +193,7 @@ def main():
         except Exception as exc:
             print(f"  skip {r['session_file']}: {exc!r}")
             continue
-        choice = beh["choice_lr"].to_numpy()
-        rewarded = beh["rewarded"].to_numpy()
-        dec = decode_session(bundle, choice, rewarded)
+        dec = decode_session(model, beh["choice_lr"].to_numpy(), beh["rewarded"].to_numpy())
         dec.insert(0, "session_file", Path(str(r["session_file"])).stem)
         dec.insert(0, "animal", str(r["animal"]))
         dec["experiment"] = r["experiment"]
@@ -150,8 +203,11 @@ def main():
     out.to_csv(OUT_CSV, index=False)
 
     occ = out.groupby(["experiment", "animal"])["is_exploit"].mean().round(3)
-    print("\nFraction of trials in the exploit state (smoothed posterior):")
+    print("\nFraction of trials in the engaged state (smoothed posterior):")
     print(occ.to_string())
+    c = out[["p_engaged_predicted", "p_engaged_filtered", "p_engaged"]].corr().round(3)
+    print("\nCorrelation between the three posteriors:")
+    print(c.to_string())
     print(f"\nwrote {OUT_CSV}  ({out['session_file'].nunique()} sessions, {len(out)} trials)")
 
 

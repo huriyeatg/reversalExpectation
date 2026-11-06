@@ -35,14 +35,24 @@ Across sessions (per cohort):
   (animals, then sessions) of the animal-weighted mean beta, and
   Benjamini-Hochberg FDR across all tests.
 
+Specifications (--specs, see SPECS below): wang_filtered (original analysis),
+wang_predicted (one-step-ahead predicted state), precue (history-only base +
+predicted state + belief latents known at cue onset). All three run on the
+same sessions and the same circular shifts; each writes to its own subfolder.
+
 Run from reversalExpectation_py (revExp env), after glmhmm_decode.py:
     python -X utf8 neuromodulator\\neuromodulator_state_baseline.py > analysis\\obj5_baseline.log 2>&1
+    python -X utf8 neuromodulator\\neuromodulator_state_baseline.py --specs precue
+Per-session results are cached in <out>/cache (delete it after changing the
+predictors); --max-seconds stops early and a re-run resumes from the cache.
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import sys
+import time
 import warnings
 import zlib
 from pathlib import Path
@@ -60,6 +70,23 @@ N_SHIFT = 1000                          # circular shifts per session (cheap: 1 
 N_BOOT = 10000                          # hierarchical bootstrap resamples
 SEED = 20261025
 OUT_DIR = ROOT / "data" / "figs" / "neuromodulator-state-baseline"
+
+# Model specifications: keys of the design dict returned by
+# neuromodulator_state_regression.build_session_design, as (base, state, belief).
+#   wang_filtered  : the original analysis. Wang base (choice/outcome at n+1..n-2,
+#                    reward MA and cumulative reward including n) + FILTERED state
+#                    P(z_n | y_1..n), which includes the choice of trial n.
+#   wang_predicted : same, with the one-step-ahead PREDICTED state P(z_n | y_1..n-1).
+#   precue         : strictly pre-cue. History-only base (n-1, n-2; MA and
+#                    cumulative reward up to n-1) + predicted state + belief
+#                    latents known at cue onset (confidence, tau, v_chosen and
+#                    |RPE| of trial n-1). Only meaningful for the pre_cue window.
+SPECS = {"wang_filtered": ("X1", "X2_filtered", "X3"),
+         "wang_predicted": ("X1", "X2", "X3"),
+         "precue": ("X1_precue", "X2", "X3_precue")}
+SPEC_WINDOWS = {"wang_filtered": ["pre_cue", "post_cue"],
+                "wang_predicted": ["pre_cue"],
+                "precue": ["pre_cue"]}
 
 
 # ---------------------------------------------------------------------------
@@ -101,17 +128,25 @@ def window_signal(Y, centers, lo, hi):
     return (y - np.nanmean(y)) / sd if sd > 0 else y * np.nan
 
 
-def session_stats(design, names, rng):
+def spec_matrices(design, spec):
+    """(X1, X2, X3) of one specification (see SPECS)."""
+    k1, k2, k3 = SPECS[spec]
+    return design[k1], design[k2], design[k3]
+
+
+def session_stats(design, names, rng, spec="wang_filtered", windows=None):
     """Real and null statistics of one session for every window.
 
     Returns {window: {"real": (n_stats,), "null": (N_SHIFT, n_stats)}} with the
     statistics ordered as names + ["F_state", "F_belief"]."""
     Y, centers = design["Y"], design["centers"]
-    X1, X2, X3, n_tr = design["X1"], design["X2"], design["X3"], design["n_tr"]
+    X1, X2, X3 = spec_matrices(design, spec)
+    n_tr = design["n_tr"]
     min_shift = 30
     shifts = rng.integers(min_shift, max(n_tr - min_shift, min_shift + 1), N_SHIFT)
     out = {}
-    for w, (lo, hi) in WINDOWS.items():
+    for w in (windows or list(WINDOWS)):
+        lo, hi = WINDOWS[w]
         y = window_signal(Y, centers, lo, hi)
         b, F21, F32 = fit_nested(y, X1, X2, X3)
         real = np.r_[b, F21, F32]
@@ -230,10 +265,22 @@ def _load(name):
 
 
 def main():
+    global N_SHIFT
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--specs", nargs="+", default=list(SPECS), choices=list(SPECS))
+    ap.add_argument("--n-shift", type=int, default=N_SHIFT)
+    ap.add_argument("--out", type=Path, default=OUT_DIR)
+    ap.add_argument("--max-seconds", type=float, default=None,
+                    help="stop processing sessions after this many seconds; per-session "
+                         "results are cached in <out>/cache, so re-running resumes")
+    args = ap.parse_args()
+    t_start = time.time()
+    N_SHIFT = args.n_shift
     reg = _load("neuromodulator_state_regression")          # shared session builder
     names = reg.STATE_PRED + reg.BELIEF_PRED
     stat_names = names + ["F_state", "F_belief"]
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_root = args.out
+    out_root.mkdir(parents=True, exist_ok=True)
 
     if not reg.STATE_CSV.exists():
         sys.exit(f"{reg.STATE_CSV} not found: run glmhmm_decode.py in the ssm env first")
@@ -245,8 +292,22 @@ def main():
     idx = idx[idx["phase"].isin(reg.PHASES)]
     idx = reg.ntr.drop_excluded_animals(idx)
 
+    cache = out_root / "cache"
+    cache.mkdir(exist_ok=True)
     records, status = [], []
     for k, (_, r) in enumerate(idx.iterrows(), 1):
+        ses_name = Path(str(r["session_file"])).stem
+        cfile = cache / f"{ses_name}.pkl"
+        if cfile.exists():                       # resume: session already processed
+            c = pd.read_pickle(cfile)
+            if set(args.specs) <= set(c["specs"]):
+                status.append(c["status"])
+                records += [rec for rec in c["records"] if rec["spec"] in args.specs]
+                continue
+        if args.max_seconds is not None and time.time() - t_start > args.max_seconds:
+            print(f"[time budget reached at session {k}/{len(idx)}: re-run to continue]")
+            sys.exit(3)
+        n_before = len(records)
         try:
             out, design = reg.build_session_design(r, states, vhr_par)
         except Exception as e:
@@ -256,49 +317,60 @@ def main():
                            "status": f"error: {e!r}"}, None
         status.append(out)
         if design is not None:
-            # stable seed per session, same rule as the per-bin analysis
-            rng = np.random.default_rng(zlib.crc32(design["ses"].encode("utf-8")))
-            st = session_stats(design, names, rng)
-            for w, d in st.items():
-                records.append({"session": design["ses"], "animal": out["animal"],
-                                "cohort": out["cohort"], "window": w,
-                                "real": d["real"], "null": d["null"]})
+            for spec in args.specs:
+                # stable seed per session, same rule as the per-bin analysis, so
+                # every spec sees the same circular shifts
+                rng = np.random.default_rng(zlib.crc32(design["ses"].encode("utf-8")))
+                st = session_stats(design, names, rng, spec, SPEC_WINDOWS[spec])
+                for w, d in st.items():
+                    records.append({"spec": spec, "session": design["ses"],
+                                    "animal": out["animal"], "cohort": out["cohort"],
+                                    "window": w, "real": d["real"], "null": d["null"]})
+        pd.to_pickle({"specs": list(args.specs), "status": out,
+                      "records": records[n_before:]}, cfile)
         print(f"[{k}/{len(idx)}] {out['session']}: {out['status']}", flush=True)
 
     status = pd.DataFrame(status)
-    status.to_csv(OUT_DIR / "session_status.csv", index=False)
+    status.to_csv(out_root / "session_status.csv", index=False)
     print("\n=== Session status ===")
     print(status.groupby(["cohort", "status"]).size().to_string())
     if not records:
         return
 
-    # per-session real values, for inspection
-    pd.DataFrame([{"session": r["session"], "animal": r["animal"], "cohort": r["cohort"],
-                   "window": r["window"], **dict(zip(stat_names, r["real"]))}
-                  for r in records]).to_csv(OUT_DIR / "session_values.csv", index=False)
+    all_res = []
+    for spec in args.specs:
+        recs = [r for r in records if r["spec"] == spec]
+        out_dir = out_root / spec
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # per-session real values, for inspection
+        pd.DataFrame([{"session": r["session"], "animal": r["animal"], "cohort": r["cohort"],
+                       "window": r["window"], **dict(zip(stat_names, r["real"]))}
+                      for r in recs]).to_csv(out_dir / "session_values.csv", index=False)
+        res = aggregate(recs, stat_names, np.random.default_rng(SEED))
+        res.insert(0, "spec", spec)
+        res.to_csv(out_dir / "baseline_stats.csv", index=False)
+        all_res.append(res)
 
-    res = aggregate(records, stat_names, np.random.default_rng(SEED))
-    res.to_csv(OUT_DIR / "baseline_stats.csv", index=False)
-
-    print("\n=== Per-trial window analysis (alternative to the per-bin analysis) ===")
-    print("betas: signal SD per SD of the predictor (from M3); two-sided p vs the shift null")
-    print("F_*  : mean log partial F; one-sided p vs the shift null")
-    print("every animal weighs the same; CI = hierarchical bootstrap (animals, sessions)\n")
-    for (coh, w), g in res.groupby(["cohort", "window"]):
-        print(f"--- {coh} | {w} {WINDOWS[w]} s | {g['n_animals'].iloc[0]} animals, "
-              f"{g['n_sessions'].iloc[0]} sessions")
-        for _, r in g.iterrows():
-            ci = (f"CI95 [{r['ci_low']:+.3f}, {r['ci_high']:+.3f}]"
-                  if pd.notna(r.get("ci_low")) else " " * 22)
-            print(f"  {r['stat']:11s} obs {r['obs']:+.4f} (null {r['null_mean']:+.4f})  "
-                  f"p={r['p']:.4f}  p_sess={r['p_session_weighted']:.4f}  "
-                  f"p_fdr={r['p_fdr_bh']:.3f}  {ci}  "
-                  f"animals {r['animals_beyond_null']}/{r['n_animals']}")
-            print(f"  {'':11s} per animal: {r['per_animal']}")
-            print(f"  {'':11s} leave-one-animal-out: {r['leave_one_animal_out']}")
-        print()
-    print(f"Results in {OUT_DIR}")
-
+        print(f"\n=== Spec: {spec}  (base {SPECS[spec][0]}, state {SPECS[spec][1]}, "
+              f"belief {SPECS[spec][2]}) ===")
+        print("betas: signal SD per SD of the predictor (from M3); two-sided p vs the shift null")
+        print("F_*  : mean log partial F; one-sided p vs the shift null")
+        print("every animal weighs the same; CI = hierarchical bootstrap (animals, sessions)\n")
+        for (coh, w), g in res.groupby(["cohort", "window"]):
+            print(f"--- {coh} | {w} {WINDOWS[w]} s | {g['n_animals'].iloc[0]} animals, "
+                  f"{g['n_sessions'].iloc[0]} sessions")
+            for _, r in g.iterrows():
+                ci = (f"CI95 [{r['ci_low']:+.3f}, {r['ci_high']:+.3f}]"
+                      if pd.notna(r.get("ci_low")) else " " * 22)
+                print(f"  {r['stat']:11s} obs {r['obs']:+.4f} (null {r['null_mean']:+.4f})  "
+                      f"p={r['p']:.4f}  p_sess={r['p_session_weighted']:.4f}  "
+                      f"p_fdr={r['p_fdr_bh']:.3f}  {ci}  "
+                      f"animals {r['animals_beyond_null']}/{r['n_animals']}")
+                print(f"  {'':11s} per animal: {r['per_animal']}")
+                print(f"  {'':11s} leave-one-animal-out: {r['leave_one_animal_out']}")
+            print()
+    pd.concat(all_res).to_csv(out_root / "baseline_stats_all_specs.csv", index=False)
+    print(f"Results in {out_root}")
 
 if __name__ == "__main__":
     main()

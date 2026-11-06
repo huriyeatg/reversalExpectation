@@ -11,8 +11,9 @@ time course):
     M1  base (Wang)   : the 14 predictors of MP_GRAB_MLR.m
                         (choice, outcome and their interaction at n+1..n-2,
                          reward moving average, cumulative reward)
-    M2  + state       : p(exploit) from the frozen GLM-HMM, FILTERED posterior
-                        (uses trials <= t only; the smoothed one would leak
+    M2  + state       : p(engaged) from the frozen GLM-HMM (primary spec, sigma = 1),
+                        one-step-ahead PREDICTED posterior P(z_t | y_1..t-1)
+                        (uses trials < t only; the smoothed one would leak
                          future choices into a question about timing)
     M3  + belief      : confidence |2b-1|, value of the chosen option, unsigned
                         prediction error |RPE|, and tau
@@ -43,7 +44,7 @@ Wang et al., so their region-specific result is a lead, not a prediction):
     grows with tau inside the L_Random window.
 
 Requires, in analysis/:
-  - glmhmm_states_neuromodulator_K2.csv  (glmhmm_decode.py, ssm env)
+  - glmhmm_states_neuromodulator_K2.csv  (glmhmm_decode.py, primary sigma = 1 model)
   - belief_vhr_lrandom_per_animal.csv / _global.csv  (belief_vhr_lrandom.py)
 
 Run from reversalExpectation_py (revExp env):
@@ -242,8 +243,15 @@ def build_session_design(row, states, vhr_par):
     c_ic = wp.encode_choice_ipsi_contra(beh["choice"].to_numpy(), site)
     X1 = wp.build_design_matrix(c_ic, np.nan_to_num(beh["rewarded"].to_numpy(), nan=0.0),
                                 beh["responded"].to_numpy())
-    # M2: causal (filtered) posterior of the exploit state
-    p_exploit = _z(st["p_engaged_filtered"].to_numpy())
+    # M2: ONE-STEP-AHEAD PREDICTED posterior of the engaged state,
+    # P(z_t | y_1..t-1): only choices/outcomes before trial t, i.e. known at cue
+    # onset. (The earlier ssm-based decoder's "p_engaged_filtered" came from
+    # ssm's HMM.filter(), which returns exactly this predicted quantity, so the
+    # previous results already used it.) The true filtered posterior
+    # P(z_t | y_1..t) includes the choice of trial t; it is kept as X2_filtered
+    # for comparison only.
+    p_exploit = _z(st["p_engaged_predicted"].to_numpy())
+    p_filtered = _z(st["p_engaged_filtered"].to_numpy())
     # M3: belief latents with the animal's own belief_vhr parameters
     par = vhr_par["__global__"]                  # one cohort-level parameter set
     tr = belief_trajectory(par, beh["choice"].to_numpy(), beh["rewarded"].to_numpy(),
@@ -268,8 +276,30 @@ def build_session_design(row, states, vhr_par):
     out["corr_state_vchosen"] = float(np.corrcoef(p_exploit[ok], X3[ok, 1])[0, 1]) if ok.sum() > 10 else np.nan
     ok = np.isfinite(X3[:, 0]) & np.isfinite(X3[:, 1])
     out["corr_conf_vchosen"] = float(np.corrcoef(X3[ok, 0], X3[ok, 1])[0, 1]) if ok.sum() > 10 else np.nan
+
+    # --- strictly PRE-CUE alternatives (only information available before the
+    # cue of trial n), used by neuromodulator_state_baseline.py --spec precue:
+    #   X1_precue    : history-only baseline. Of the Wang predictors, keep choice,
+    #                  outcome and their interaction at n-1 and n-2; drop n+1 and n.
+    #                  Reward moving average and cumulative reward are shifted
+    #                  by one trial so they end at n-1 (the Wang versions include
+    #                  trial n; the cumulative one is divided by the session total,
+    #                  a per-session constant that z-scoring/OLS absorbs).
+    #   state        : X2 (already the one-step-ahead predicted posterior)
+    #   X3_precue    : belief latents known at cue onset. confidence and tau are
+    #                  already defined at decision time; v_chosen and |RPE| depend
+    #                  on the choice / outcome of trial n, so the n-1 values are used.
+    lag1 = lambda v: wp._lag(np.asarray(v, float), 1)                  # noqa: E731
+    lag2 = lambda v: wp._lag(np.asarray(v, float), 2)                  # noqa: E731
+    C, R, CR = X1[:, 1], X1[:, 5], X1[:, 9]                 # columns at lag 0 (trial n)
+    X1_precue = np.column_stack([lag1(C), lag2(C), lag1(R), lag2(R), lag1(CR), lag2(CR),
+                                 lag1(X1[:, 12]), lag1(X1[:, 13])])
+    X2_filtered = np.column_stack([p_filtered])
+    X3_precue = np.column_stack([_z(tr["confidence"]), _z(lag1(v_chosen)), _z(lag1(abs_rpe)),
+                                 _z(beh["tau"].clip(lower=0).to_numpy())])
     return out, {"Y": Y, "centers": centers, "X1": X1, "X2": X2, "X3": X3,
-                 "n_tr": len(beh), "ses": ses}
+                 "X1_precue": X1_precue, "X2_filtered": X2_filtered,
+                 "X3_precue": X3_precue, "n_tr": len(beh), "ses": ses}
 
 
 def process_session(row, states, vhr_par):

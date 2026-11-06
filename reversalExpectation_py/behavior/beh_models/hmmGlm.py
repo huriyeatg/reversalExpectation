@@ -71,7 +71,11 @@ STICKY_SELF = 0.95      # initial self-transition probability
 # the GLM weights (smaller = stronger shrinkage); transition_alpha is the
 # Dirichlet concentration on the transition rows (1 = ~MLE); transition_kappa
 # adds extra mass to self-transitions (0 = none, rely on init).
-PRIOR_SIGMA = 100.0
+# PRIMARY specification of the project: sigma = 1 (was 100). The exploit
+# state is quasi-separated, so with sigma = 100 its weights are not identified
+# (they drift with the stopping rule); sigma = 1 costs < 0.0001 nats/trial of
+# held-out LL (glmhmm_regularization.py). Same value as glmhmm_fit_primary.py.
+PRIOR_SIGMA = 1.0
 TRANSITION_ALPHA = 1.0
 TRANSITION_KAPPA = 0.0
 
